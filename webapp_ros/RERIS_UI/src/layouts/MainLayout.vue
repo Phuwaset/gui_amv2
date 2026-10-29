@@ -11,9 +11,46 @@
           @click="toggleSetupDrawer"
           class="menu-btn"
         />
-        <q-toolbar-title class="app-title">
-          <span class="title-text">Rebot</span>
+        <q-toolbar-title class="app-title" style="flex: none; margin-right: 12px;">
+          <span class="title-text">AMV2</span>
         </q-toolbar-title>
+
+        <!-- AMV2 Telemetry Status Bar -->
+        <div class="amv-hud-row">
+          <!-- Connection Status -->
+          <div class="hud-chip" :class="amvBridge.isConnected.value ? 'hud-chip--online' : 'hud-chip--offline'">
+            <span class="hud-status-dot" />
+            <span>{{ amvBridge.isConnected.value ? 'Online' : 'Offline' }}</span>
+          </div>
+
+          <!-- Battery -->
+          <div v-if="amvBridge.isConnected.value && amvBridge.batteryLevel.value !== null" class="hud-chip">
+            <q-icon
+              :name="amvBridge.isCharging.value ? 'battery_charging_full' : 'battery_std'"
+              size="15px"
+              :color="amvBridge.batteryLevel.value > 20 ? 'green-4' : 'red-4'"
+            />
+            <span>{{ amvBridge.batteryLevel.value }}%</span>
+          </div>
+
+          <!-- Emergency Stop -->
+          <div
+            v-if="amvBridge.isConnected.value"
+            class="hud-chip"
+            :class="amvBridge.isEmergency.value ? 'hud-chip--danger' : 'hud-chip--safe'"
+          >
+            <q-icon name="emergency" size="14px" />
+            <span>{{ amvBridge.isEmergency.value ? 'E-STOP' : 'E-Stop OK' }}</span>
+          </div>
+
+          <!-- Current Station -->
+          <div v-if="amvBridge.isConnected.value" class="hud-chip">
+            <q-icon name="place" size="14px" color="blue-4" />
+            <span class="station-text">{{ amvBridge.currentStation.value }}</span>
+          </div>
+        </div>
+
+        <q-space />
 
         <div class="user-section">
           <div class="user-info" @click="$router.push('/profile')">
@@ -113,6 +150,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import axios from 'axios'
 import { server_api_config } from 'src/configs/server'
+import { amvBridge } from 'src/services/amvBridgeService'
 
 const drawerOpen = ref(true)
 const isMini = ref(true)
@@ -184,12 +222,14 @@ async function checkProfile () {
 }
 
 onMounted(async () => {
+  amvBridge.connect('192.168.50.115', 9090)
   await checkProfile()
   // Poll every 30 s to kick the session if the admin bans a signed-in user
   banPollTimer = setInterval(() => { void checkProfile() }, 30_000)
 })
 
 onUnmounted(() => {
+  amvBridge.disconnect()
   if (banPollTimer !== null) clearInterval(banPollTimer)
 })
 </script>
@@ -524,5 +564,72 @@ body, .q-layout {
 
 :deep(.q-layout__section--marginal) {
   background: #252525 !important;
+}
+
+/* ── AMV2 Telemetry HUD ────────────────────────────────────── */
+.amv-hud-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 10px;
+}
+
+.hud-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 12px;
+  font-weight: 500;
+  color: #d1d1d6;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  line-height: 1;
+}
+
+.hud-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #8e8e93;
+}
+
+.hud-chip--online {
+  border-color: rgba(52, 199, 89, 0.35);
+  color: #34c759;
+}
+.hud-chip--online .hud-status-dot {
+  background: #34c759;
+  box-shadow: 0 0 6px #34c759;
+}
+
+.hud-chip--offline {
+  border-color: rgba(142, 142, 147, 0.3);
+  color: #8e8e93;
+}
+
+.hud-chip--safe {
+  border-color: rgba(52, 199, 89, 0.25);
+  color: #34c759;
+}
+
+.hud-chip--danger {
+  background: rgba(255, 59, 48, 0.2);
+  border-color: #ff3b30;
+  color: #ff3b30;
+  animation: pulse-danger 1.2s infinite;
+}
+
+@keyframes pulse-danger {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.station-text {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
