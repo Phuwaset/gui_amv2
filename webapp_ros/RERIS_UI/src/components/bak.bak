@@ -1,0 +1,431 @@
+<template>
+  <div class="map-container">
+    <div class="status" :class="{ connected: isConnected, disconnected: !isConnected }">
+      {{ isConnected ? 'Connected' : 'Disconnected' }}
+    </div>
+    <div class="canvas-container" @wheel="handleWheel" @touchstart="handleTouchStart" @touchmove="handleTouchMove" @touchend="handleTouchEnd" @mousedown="handleMouseDown" @mousemove="handleMouseMove" @mouseup="handleMouseUp" @mouseleave="handleMouseUp">
+      <canvas ref="canvas" :width="canvasWidth" :height="canvasHeight"></canvas>
+    </div>
+    <div class="map-controls">
+      <button @click="reconnectWebSocket" :disabled="isConnected">Reconnect</button>
+      <div class="zoom-container">
+        <div class="zoom-controls">
+          <button @click="zoomIn">+</button>
+          <button @click="zoomOut">-</button>
+        </div>
+        <div class="zoom-size">
+          Size: {{ zoomLevel.toFixed(1) }}
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount } from 'vue';
+
+interface OccupancyGrid {
+  width: number;
+  height: number;
+  resolution: number;
+  origin_x: number;
+  origin_y: number;
+  data: number[];
+  downsampled: boolean;
+  originalDimensions: { width: number; height: number };
+}
+
+const canvas = ref<HTMLCanvasElement | null>(null);
+const mapData = ref<OccupancyGrid | null>(null);
+const robotPosition = ref<{ x: number; y: number, yaw: number }>({ x: 0, y: 0 });
+const isConnected = ref(false);
+const zoomLevel = ref(1.0);
+const canvasWidth = ref(800);
+const canvasHeight = ref(600);
+const offsetX = ref(0); // Pan offset
+const offsetY = ref(0); // Pan offset
+const isDragging = ref(false); // Track dragging state
+const startDrag = ref({ x: 0, y: 0 }); // Starting point for drag
+
+let ws: WebSocket | null = null;
+let reconnectTimeout: number | null = null;
+
+let touchStartDist = 0;
+let touchStartZoom = 1.0;
+
+const connectWebSocket = () => {
+  if (ws) {
+    ws.close();
+  }
+
+  ws = new WebSocket('ws://192.168.10.2:7448');
+
+  ws.onopen = () => {
+    console.log('WebSocket connection established');
+    isConnected.value = true;
+    if (reconnectTimeout !== null) {
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
+    }
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const raw_data = JSON.parse(event.data);
+      const data = raw_data.map;
+      if (data.width && data.height && data.data) {
+        mapData.value = {
+          width: data.width,
+          height: data.height,
+          resolution: data.resolution,
+          origin_x: data.origin ? data.origin[0] : 0,
+          origin_y: data.origin ? data.origin[1] : 0,
+          data: data.compressed ? decompressData(data.data) : data.data,
+          downsampled: data.downsampled,
+          originalDimensions: data.original_dimensions
+        };
+
+        adjustCanvasSize();
+        drawMap();
+      }
+
+      robotPosition.value.y = raw_data.odom.position.y;
+      robotPosition.value.x = raw_data.odom.position.x;
+      robotPosition.value.yaw = -(quaternionToEuler(raw_data.odom.orientation.x, raw_data.odom.orientation.y, raw_data.odom.orientation.z, raw_data.odom.orientation.w).yaw - 1.5708);
+    } catch (error) {
+      console.error('Error parsing WebSocket message:', error);
+    }
+  };
+
+  ws.onerror = (error) => {
+    console.error('WebSocket error:', error);
+    isConnected.value = false;
+  };
+
+  ws.onclose = () => {
+    console.log('WebSocket connection closed');
+    isConnected.value = false;
+
+    reconnectTimeout = window.setTimeout(() => {
+      console.log('Attempting to reconnect...');
+      connectWebSocket();
+    }, 5000);
+  };
+};
+
+const reconnectWebSocket = () => {
+  if (reconnectTimeout !== null) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+  connectWebSocket();
+};
+
+const decompressData = (compressedData: [number, number][]) => {
+  const result: number[] = [];
+
+  for (const [value, count] of compressedData) {
+    for (let i = 0; i < count; i++) {
+      result.push(value);
+    }
+  }
+
+  return result;
+};
+
+const adjustCanvasSize = () => {
+  if (!mapData.value) return;
+
+  const aspectRatio = mapData.value.width / mapData.value.height;
+  const viewportWidth = window.innerWidth * 0.9;
+  const viewportHeight = window.innerHeight * 0.7;
+
+  if (aspectRatio > 1) {
+    canvasWidth.value = Math.min(viewportWidth, mapData.value.width * zoomLevel.value);
+    canvasHeight.value = canvasWidth.value / aspectRatio;
+  } else {
+    canvasHeight.value = Math.min(viewportHeight, mapData.value.height * zoomLevel.value);
+    canvasWidth.value = canvasHeight.value * aspectRatio;
+  }
+};
+
+const zoomIn = () => {
+  zoomLevel.value += 0.1;
+  adjustCanvasSize();
+  drawMap();
+};
+
+const zoomOut = () => {
+  zoomLevel.value -= 0.1;
+  zoomLevel.value = Math.max(0.1, zoomLevel.value); // Ensure zoom doesn't go below 0.1
+  adjustCanvasSize();
+  drawMap();
+};
+
+const handleWheel = (event: WheelEvent) => {
+  if (event.deltaY < 0) {
+    zoomIn();
+  } else {
+    zoomOut();
+  }
+  event.preventDefault();
+};
+
+const handleTouchStart = (event: TouchEvent) => {
+  if (event.touches.length === 2) {
+    touchStartDist = Math.hypot(
+      event.touches[0].clientX - event.touches[1].clientX,
+      event.touches[0].clientY - event.touches[1].clientY
+    );
+    touchStartZoom = zoomLevel.value;
+  }
+};
+
+const handleTouchMove = (event: TouchEvent) => {
+  if (event.touches.length === 2) {
+    const touchDist = Math.hypot(
+      event.touches[0].clientX - event.touches[1].clientX,
+      event.touches[0].clientY - event.touches[1].clientY
+    );
+    const zoomFactor = touchDist / touchStartDist;
+    zoomLevel.value = touchStartZoom * zoomFactor;
+    zoomLevel.value = Math.max(0.1, Math.min(zoomLevel.value, 5.0)); // Limit zoom between 0.1 and 5.0
+    adjustCanvasSize();
+    drawMap();
+  }
+};
+
+const handleTouchEnd = () => {
+  touchStartDist = 0;
+  touchStartZoom = 1.0;
+};
+
+const handleMouseDown = (event: MouseEvent) => {
+  isDragging.value = true;
+  startDrag.value = { x: event.clientX, y: event.clientY };
+};
+
+const handleMouseMove = (event: MouseEvent) => {
+  if (isDragging.value) {
+    const dx = event.clientX - startDrag.value.x;
+    const dy = event.clientY - startDrag.value.y;
+    offsetX.value += dx;
+    offsetY.value += dy;
+    startDrag.value = { x: event.clientX, y: event.clientY };
+    drawMap();
+  }
+};
+
+const handleMouseUp = () => {
+  isDragging.value = false;
+};
+
+function quaternionToEuler(x: number, y: number, z: number, w: number) {
+  const sinr_cosp = 2 * (w * x + y * z);
+  const cosr_cosp = 1 - 2 * (x * x + y * y);
+  const roll = Math.atan2(sinr_cosp, cosr_cosp);
+
+  const sinp = 2 * (w * y - z * x);
+  const pitch = Math.asin(Math.max(-1, Math.min(1, sinp)));
+
+  const siny_cosp = 2 * (w * z + x * y);
+  const cosy_cosp = 1 - 2 * (y * y + z * z);
+  const yaw = Math.atan2(siny_cosp, cosy_cosp);
+
+  return { roll, pitch, yaw };
+}
+
+const drawMap = () => {
+  if (!canvas.value || !mapData.value) return;
+
+  const ctx = canvas.value.getContext('2d');
+  if (!ctx) return;
+
+  ctx.imageSmoothingEnabled = false;
+
+  const { width, height, data, resolution, origin_x, origin_y } = mapData.value;
+
+  ctx.clearRect(0, 0, canvas.value.width, canvas.value.height);
+
+  const scaleX = canvas.value.width / width;
+  const scaleY = canvas.value.height / height;
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = width;
+  tempCanvas.height = height;
+  const tempCtx = tempCanvas.getContext('2d');
+
+  if (!tempCtx) return;
+
+  const imgData = tempCtx.createImageData(width, height);
+
+  for (let i = 0; i < data.length; i++) {
+    const val = data[i];
+    let r, g, b;
+
+    if (val === -1) {
+      r = g = b = 127;
+    } else if (val === 0) {
+      r = g = b = 240;
+    } else if (val === 100) {
+      r = g = b = 0;
+    } else {
+      const intensity = 255 - (val * 2.55);
+      r = g = b = intensity;
+    }
+
+    const x = i % width;
+    const y = Math.floor(i / width);
+
+    const flippedY = height - 1 - y;
+
+    imgData.data[(flippedY * width + x) * 4] = r;
+    imgData.data[(flippedY * width + x) * 4 + 1] = g;
+    imgData.data[(flippedY * width + x) * 4 + 2] = b;
+    imgData.data[(flippedY * width + x) * 4 + 3] = 255;
+  }
+
+  tempCtx.putImageData(imgData, 0, 0);
+  ctx.drawImage(tempCanvas, 0, 0, width, height, offsetX.value, offsetY.value, canvas.value.width, canvas.value.height);
+
+  if (robotPosition.value) {
+    const robotX = ((robotPosition.value.x - origin_x) / resolution) * scaleX + offsetX.value;
+    const robotY = (height - (robotPosition.value.y - origin_y) / resolution) * scaleY + offsetY.value;
+
+    const angle = robotPosition.value.yaw;
+
+    const triangleSize = 10 * zoomLevel.value;
+
+    const points = [
+      { x: robotX, y: robotY - triangleSize },
+      { x: robotX - triangleSize / 2, y: robotY + triangleSize / 2 },
+      { x: robotX + triangleSize / 2, y: robotY + triangleSize / 2 }
+    ];
+
+    const rotatedPoints = points.map(point => {
+      const x = point.x - robotX;
+      const y = point.y - robotY;
+      const rotatedX = x * Math.cos(angle) - y * Math.sin(angle) + robotX;
+      const rotatedY = x * Math.sin(angle) + y * Math.cos(angle) + robotY;
+      return { x: rotatedX, y: rotatedY };
+    });
+
+    ctx.fillStyle = "green";
+    ctx.beginPath();
+    ctx.moveTo(rotatedPoints[0].x, rotatedPoints[0].y);
+    ctx.lineTo(rotatedPoints[1].x, rotatedPoints[1].y);
+    ctx.lineTo(rotatedPoints[2].x, rotatedPoints[2].y);
+    ctx.closePath();
+    ctx.fill();
+
+    const circleRadius = Math.min(
+      triangleSize * 2,
+      Math.min(canvas.value.width, canvas.value.height) * 0.065
+    );
+
+    ctx.fillStyle = "rgba(0, 255, 0, 0.3)";
+    ctx.beginPath();
+    ctx.arc(robotX, robotY, circleRadius, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+};
+
+onMounted(() => {
+  connectWebSocket();
+  adjustCanvasSize();
+  window.addEventListener('resize', adjustCanvasSize);
+});
+
+onBeforeUnmount(() => {
+  if (ws) {
+    ws.close();
+  }
+
+  if (reconnectTimeout !== null) {
+    clearTimeout(reconnectTimeout);
+  }
+
+  window.removeEventListener('resize', adjustCanvasSize);
+});
+</script>
+
+<style scoped>
+.map-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.status {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  font-size: 1.2em;
+}
+
+.connected {
+  color: green;
+}
+
+.disconnected {
+  color: red;
+}
+
+.canvas-container {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  touch-action: none; /* Prevent default actions like scrolling or zooming */
+  background-color: #7f7f7f;
+}
+
+.map-controls {
+  position: absolute;
+  bottom: 20px;
+  left: 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.zoom-container {
+  border: 2px solid #000;
+  padding: 10px;
+  text-align: center;
+  background-color: rgba(25, 25, 25, 0.6);
+  opacity: 10;
+  border-radius: 5px; /* Optional: adds rounded corners */
+}
+
+.zoom-controls {
+  display: flex;
+  flex-direction: column;
+}
+
+.zoom-controls button {
+  font-size: 24px;
+  padding: 10px;
+  margin: 5px;
+  background-color: rgba(0, 0, 0, 0.6);
+  color: white;
+  border: none;
+  border-radius: 5px;
+}
+
+.zoom-controls button:hover {
+  background-color: rgba(0, 0, 0, 1);
+}
+
+.zoom-size {
+  margin-top: 10px;
+  font-size: 16px;
+  color: #fff; /* White text for the zoom size */
+}
+
+</style>

@@ -1,0 +1,38 @@
+.joystick-container {
+    position: relative;
+    width: 300px;
+    height: 300px;
+    
+    /* border-radius: 50%; */
+    /* background-color: #000000; */
+    cursor: pointer;
+    overflow: hidden;
+    touch-action: none; /* Prevents page scrolling while using joystick */
+    /* opacity: 10%; */
+}
+
+.joystick {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 50%;
+    height: 50%;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background-color: #bbb;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    opacity: 100%;
+}
+
+.rumble {
+    position: absolute;
+    width: 70px;
+    height: 70px;
+    background-color: rgba(25, 25, 25, 0.6);
+    border-radius: 50%;
+    transition: all 0.1s ease;
+    pointer-events: none;
+    transform: translate(-50%, -50%); /* Ensure proper centering */
+}

@@ -1,0 +1,314 @@
+// src/services/socketService.ts
+import { ref, type Ref } from 'vue';
+import type { IPosition } from 'src/interfaces/robot_interfaces';
+import type { OccupancyGrid } from 'src/components/assets/map/interfaces/map_interface';
+import { payloadAction } from 'src/interfaces/socket_interface';
+
+interface OdomData {
+  position: { x: number; y: number; z: number };
+  orientation: { x: number; y: number; z: number; w: number };
+}
+
+interface WebSocketMessage {
+  map?: OccupancyGrid & {
+    compressed?: boolean;
+    downsampled?: boolean;
+    original_dimensions?: { width: number; height: number };
+    origin?: [number, number];
+  };
+  odom?: OdomData;
+  map_updated?: boolean;
+  [key: string]: unknown;
+}
+
+type MessageCallback = (message: WebSocketMessage) => void;
+type ConnectionCallback = (connected: boolean) => void;
+
+export class SocketService {
+  private static instance: SocketService;
+  private ws: WebSocket | null = null;
+  private reconnectTimeout: number | null = null;
+  private messageCallbacks: Set<MessageCallback> = new Set();
+  private connectionCallbacks: Set<ConnectionCallback> = new Set();
+
+  public isConnected: Ref<boolean> = ref(false);
+  public connectionAttempts: Ref<number> = ref(0);
+
+  private config = {
+    ip: '',
+    port: 0,
+    reconnectDelay: 1000,
+    maxReconnectDelay: 30000,
+  };
+
+  private constructor() { }
+
+  static getInstance(): SocketService {
+    if (!SocketService.instance) {
+      SocketService.instance = new SocketService();
+    }
+    return SocketService.instance;
+  }
+
+
+
+
+
+  connect(ip: string, port: number): void {
+    this.config.ip = ip;
+    this.config.port = port;
+    this.attemptConnection();
+  }
+
+  private attemptConnection(): void {
+    if (this.ws) {
+      this.ws.close();
+    }
+
+    console.log(`[SocketService] Connecting to ws://${this.config.ip}:${this.config.port}`);
+    this.ws = new WebSocket(`ws://${this.config.ip}:${this.config.port}`);
+
+    this.ws.onopen = () => {
+      console.log('[SocketService] Connected');
+      this.isConnected.value = true;
+      this.connectionAttempts.value = 0;
+      this.notifyConnectionCallbacks(true);
+
+      if (this.reconnectTimeout) {
+        clearTimeout(this.reconnectTimeout);
+        this.reconnectTimeout = null;
+      }
+    };
+
+    this.ws.onmessage = (event) => {
+      try {
+        const message: WebSocketMessage = JSON.parse(event.data);
+        this.notifyMessageCallbacks(message);
+      } catch (error) {
+        console.error('[SocketService] Message parse error:', error);
+      }
+    };
+
+    this.ws.onerror = (error) => {
+      console.error('[SocketService] WebSocket error:', error);
+    };
+
+    this.ws.onclose = () => {
+      console.log('[SocketService] Disconnected');
+      this.isConnected.value = false;
+      this.notifyConnectionCallbacks(false);
+      this.scheduleReconnect();
+    };
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimeout) return;
+
+    this.connectionAttempts.value++;
+    const delay = Math.min(
+      this.config.reconnectDelay * Math.pow(1.5, this.connectionAttempts.value - 1),
+      this.config.maxReconnectDelay
+    );
+
+    console.log(`[SocketService] Reconnecting in ${delay}ms (attempt ${this.connectionAttempts.value})`);
+
+    this.reconnectTimeout = setTimeout(() => {
+      this.reconnectTimeout = null;
+      this.attemptConnection();
+    }, delay);
+  }
+
+  disconnect(): void {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this.isConnected.value = false;
+  }
+
+  // Subscribe to messages
+  onMessage(callback: MessageCallback): () => void {
+    this.messageCallbacks.add(callback);
+    // Return unsubscribe function
+    return () => {
+      this.messageCallbacks.delete(callback);
+    };
+  }
+
+  // Subscribe to connection status
+  onConnectionChange(callback: ConnectionCallback): () => void {
+    this.connectionCallbacks.add(callback);
+    // Immediately notify current state
+    callback(this.isConnected.value);
+    // Return unsubscribe function
+    return () => {
+      this.connectionCallbacks.delete(callback);
+    };
+  }
+
+  private notifyMessageCallbacks(message: WebSocketMessage): void {
+    this.messageCallbacks.forEach(callback => {
+      try {
+        callback(message);
+      } catch (error) {
+        console.error('[SocketService] Callback error:', error);
+      }
+    });
+  }
+
+  private notifyConnectionCallbacks(connected: boolean): void {
+    this.connectionCallbacks.forEach(callback => {
+      try {
+        callback(connected);
+      } catch (error) {
+        console.error('[SocketService] Connection callback error:', error);
+      }
+    });
+  }
+
+  sendHeatbeat(heartbeat: boolean) {
+    if (!this.isConnected.value) {
+      console.warn('[SocketService] Cannot send velocity - not connected');
+      return;
+    }
+
+    const payload = {
+      action : "3",
+      heartbeat: heartbeat
+    };
+
+    this.send(payload);
+  }
+
+
+  // Send commands
+  
+  
+  sendExecMultiGoal(): void {
+    if (!this.isConnected.value) {
+      console.warn('[SocketService] Cannot send velocity - not connected');
+      return;
+    }
+
+    const payload = {
+      action: payloadAction.exec_multi_cmd,
+      cmd: 0,
+    };
+
+    this.send(payload);
+    console.log(payload)
+  }
+
+
+   sendCancelMultiGoal(): void {
+    if (!this.isConnected.value) {
+      console.warn('[SocketService] Cannot send velocity - not connected');
+      return;
+    }
+
+    const payload = {
+      action: payloadAction.exec_multi_cmd,
+      cmd: 1,
+    };
+
+    this.send(payload);
+    console.log(payload)
+  }
+
+
+  sendVelocityCommand(Vx: number, Vy: number, hearthbeat: boolean): void {
+    if (!this.isConnected.value) {
+      console.warn('[SocketService] Cannot send velocity - not connected');
+      return;
+    }
+
+    const payload = {
+      action: payloadAction.vel_cmd,
+      Vx,
+      Vy,
+      hearthbeat,
+    };
+
+    this.send(payload);
+  }
+
+  sendGoalCommand(position: IPosition | IPosition[]): void {
+    if (!this.isConnected.value) {
+      console.warn('[SocketService] Cannot send goal - not connected');
+      return;
+    }
+
+    const payload = Array.isArray(position)
+      ? {
+        action: payloadAction.goal_multi_cmd,
+        position: position,
+      }
+      : {
+        action: payloadAction.goal_cmd,
+        position: position,
+      };
+
+    this.send(payload);
+  }
+
+  sendCustomCommand(action: string, data: Record<string, unknown>): void {
+    if (!this.isConnected.value) {
+      console.warn('[SocketService] Cannot send command - not connected');
+      return;
+    }
+
+    this.send({ action, ...data });
+  }
+
+  private send(data: unknown): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify(data));
+      } catch (error) {
+        console.error('[SocketService] Send error:', error);
+      }
+    }
+  }
+
+  // Utility method for components
+  getConnectionStatus(): boolean {
+    return this.isConnected.value;
+  }
+}
+
+
+// onMounted(() => {
+//   heartbeatInterval = setInterval(() => {
+//     heartbeatTick = !heartbeatTick;
+//     socketService.sendHeatbeat(heartbeatTick);
+//     console.log(heartbeatTick)
+//   }, 10);
+// });
+
+// const stopHeartbeat = () => {
+//   if (heartbeatInterval !== null) {
+//     clearInterval(heartbeatInterval);
+//     heartbeatTick = false;
+//     heartbeatInterval = null;
+//   }
+// };
+
+// onBeforeUnmount(() => {
+//   stopHeartbeat();
+// });
+
+// onUnmounted(() => {
+//   stopHeartbeat();
+// });
+
+
+// Export singleton instance
+export const socketService = SocketService.getInstance();
+
+

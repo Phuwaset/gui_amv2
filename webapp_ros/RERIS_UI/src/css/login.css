@@ -1,0 +1,58 @@
+.login-header-label{
+    color: #252525;
+}
+
+.login-header-title-label{
+    font-size: 55px;
+}
+
+.login-header-subtitle-label{
+    font-size: 25px;
+    color : #8E8686;
+}
+
+.login-header-forget-label{
+    /* position: relative; */
+    top : 250%;
+    text-align: center;
+    color : #8E8686;
+}
+
+.login-header-button-sign-in{
+    top : 10%;
+}
+
+.login-username-label{
+    /* top : -10%; */
+    /* width: 300px; */
+}
+.login-password-label{
+
+}
+
+@font-face {
+    font-family: 'RedHatDisplay'; /* Same name for consistency */
+    src: url('../assets/fonts/Red_Hat_Display/RedHatDisplay-VariableFont_wght.ttf') format('truetype');
+    font-weight: 700; /* Bold weight */
+    font-style: normal; /* Normal style */
+}
+
+/* Custom font class */
+.red-hat-normal-font {
+    font-family: 'RedHatDisplay', sans-serif;
+}
+
+
+.no-wrap {
+    white-space: nowrap;
+    overflow: hidden; /* Optional: hides any overflowed text */
+    text-overflow: ellipsis; /* Optional: adds "..." if the text overflows */
+}
+
+* {
+    user-select: none; /* Prevent text selection */
+    -webkit-user-select: none; /* For Safari */
+    -ms-user-select: none; /* For older versions of Internet Explorer */
+    
+}
+

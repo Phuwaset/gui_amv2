@@ -1,0 +1,6 @@
+@rebot_api_HostAddress = http://192.168.10.5:5184
+
+GET {{rebot_api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

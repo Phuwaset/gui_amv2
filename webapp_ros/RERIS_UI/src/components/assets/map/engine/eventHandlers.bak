@@ -1,0 +1,392 @@
+// src/components/map/engine/eventHandlers.ts
+import type { MapState, SelectedKind } from '../state/mapState';
+import type { MapEngine } from './MapEngine';
+import type { ToolType } from '../toolbox/ToolBox.vue';
+import type { SocketClient } from '../io/SocketClient';
+
+export class EventHandlers {
+  private state: MapState;
+  private engine: MapEngine;
+  private socketClient: SocketClient;
+
+  constructor(state: MapState, engine: MapEngine, socketClient: SocketClient) {
+    this.state = state;
+    this.engine = engine;
+    this.socketClient = socketClient;
+  }
+
+
+
+  // Cursor Tool
+  // ---- Pointer helpers ----
+  private getPrimaryTouch(e: TouchEvent): Touch | null {
+    if (e.touches && e.touches.length > 0) return e.touches[0];
+    if (e.changedTouches && e.changedTouches.length > 0) return e.changedTouches[0];
+    return null;
+  }
+
+  private getClientXY(e: MouseEvent | Touch | TouchEvent): { clientX: number; clientY: number } {
+    if (typeof TouchEvent !== 'undefined' && e instanceof TouchEvent) {
+      const t = this.getPrimaryTouch(e);
+      return t ? { clientX: t.clientX, clientY: t.clientY } : { clientX: 0, clientY: 0 };
+    }
+    if (typeof Touch !== 'undefined' && e instanceof Touch) {
+      return { clientX: e.clientX, clientY: e.clientY };
+    }
+    const me = e as MouseEvent;
+    return { clientX: me.clientX, clientY: me.clientY };
+  }
+
+  // ---- Pixel distance ----
+  private dist2(a: { x: number; y: number }, b: { x: number; y: number }) {
+    const dx = a.x - b.x, dy = a.y - b.y;
+    return dx * dx + dy * dy;
+  }
+
+  // ---- Close icon rect (×) สำหรับ object ที่ถูก select ----
+  private getCloseIconRectForSelection(): { x: number; y: number; w: number; h: number } | null {
+    const sel = this.state.selectedObject.value;
+    if (!sel) return null;
+
+    const sz = this.state.closeIconSize.value;
+    const off = this.state.closeIconOffsetPx.value;
+
+    if (sel.type === 'single') {
+      const p = this.engine.worldToCanvas(this.state.singleGoal.value.x, this.state.singleGoal.value.y);
+      return { x: p.x + off, y: p.y - off - sz, w: sz, h: sz };
+    }
+    if (sel.type === 'multi') {
+      const g = this.state.multiGoal.value[sel.index];
+      if (!g) return null;
+      const p = this.engine.worldToCanvas(g.x, g.y);
+      return { x: p.x + off, y: p.y - off - sz, w: sz, h: sz };
+    }
+    if (sel.type === 'rect' || sel.type === 'rect-handle') {
+      const r = this.state.areaRects.value.find(it => it.id === sel.id);
+      if (!r) return null;
+      const c1 = this.engine.worldToCanvas(r.p1.x, r.p1.y);
+      const c2 = this.engine.worldToCanvas(r.p2.x, r.p2.y);
+      const x = Math.min(c1.x, c2.x), y = Math.min(c1.y, c2.y);
+      return { x: x + Math.abs(c2.x - c1.x) - sz - off, y: y + off, w: sz, h: sz };
+    }
+    return null;
+  }
+
+  private hitCloseIcon(canvasX: number, canvasY: number): boolean {
+    const r = this.getCloseIconRectForSelection();
+    if (!r) return false;
+    return canvasX >= r.x && canvasX <= r.x + r.w && canvasY >= r.y && canvasY <= r.y + r.h;
+  }
+
+  // ---- Hit-test object บนแคนวาส ----
+  private hitTestSelection(canvasX: number, canvasY: number): SelectedKind | null {
+    const radius2 = this.state.hitRadiusPx.value * this.state.hitRadiusPx.value;
+
+    // single
+    if (this.state.singleGoal.value) {
+      const p = this.engine.worldToCanvas(this.state.singleGoal.value.x, this.state.singleGoal.value.y);
+      if (this.dist2({ x: canvasX, y: canvasY }, p) <= radius2) return { type: 'single' };
+    }
+
+    // multi (วนจากบนสุด)
+    for (let i = this.state.multiGoal.value.length - 1; i >= 0; --i) {
+      const g = this.state.multiGoal.value[i];
+      const p = this.engine.worldToCanvas(g.x, g.y);
+      if (this.dist2({ x: canvasX, y: canvasY }, p) <= radius2) return { type: 'multi', index: i };
+    }
+
+    // rect handles & body (วนจากบนสุด)
+    for (let i = this.state.areaRects.value.length - 1; i >= 0; --i) {
+      const r = this.state.areaRects.value[i];
+      const p1 = this.engine.worldToCanvas(r.p1.x, r.p1.y);
+      const p2 = this.engine.worldToCanvas(r.p2.x, r.p2.y);
+
+      if (this.dist2({ x: canvasX, y: canvasY }, p1) <= radius2) return { type: 'rect-handle', id: r.id, handle: 'p1' };
+      if (this.dist2({ x: canvasX, y: canvasY }, p2) <= radius2) return { type: 'rect-handle', id: r.id, handle: 'p2' };
+
+      const x = Math.min(p1.x, p2.x), y = Math.min(p1.y, p2.y);
+      const w = Math.abs(p2.x - p1.x), h = Math.abs(p2.y - p1.y);
+      if (canvasX >= x && canvasX <= x + w && canvasY >= y && canvasY <= y + h) {
+        return { type: 'rect', id: r.id };
+      }
+    }
+    return null;
+  }
+
+  // ---- ลบ object ที่เลือก ----
+  private deleteSelected(): void {
+    const sel = this.state.selectedObject.value;
+    if (!sel) return;
+
+    if (sel.type === 'single') {
+      this.state.singleGoal.value = { x: 0, y: 0, yaw: 0 };
+    } else if (sel.type === 'multi') {
+      const arr = this.state.multiGoal.value;
+      if (sel.index >= 0 && sel.index < arr.length) {
+        arr.splice(sel.index, 1);
+        this.state.multiGoal.value = [...arr];
+      }
+    } else if (sel.type === 'rect' || sel.type === 'rect-handle') {
+      this.state.areaRects.value = this.state.areaRects.value.filter(r => r.id !== sel.id);
+    }
+    this.state.selectedObject.value = null;
+  }
+  //
+
+  // Mouse events
+  handleMouseDown = (event: MouseEvent): void => {
+    if (event.button !== 0) return;
+    this.useSelectTarget(event);
+  };
+
+  handleMouseMove = (event: MouseEvent): void => {
+    if (this.state.isSettingYaw.value || this.state.isSettingArea.value) {
+      this.useSelectTargetMove(event);
+      return;
+    }
+
+    if (this.state.isDragging.value) {
+      const dx = event.clientX - this.state.lastPointerPos.value.x;
+      const dy = event.clientY - this.state.lastPointerPos.value.y;
+      const currentTransform = this.engine.getSmoothTransform().getCurrent();
+      this.engine.getSmoothTransform().setTarget({
+        translateX: currentTransform.translateX + dx,
+        translateY: currentTransform.translateY + dy,
+      });
+      this.state.lastPointerPos.value = { x: event.clientX, y: event.clientY };
+    }
+  };
+
+  handleMouseUp = (): void => {
+    this.useSelectTargetEnd();
+    this.state.isDragging.value = false;
+  };
+
+  // Wheel event
+  handleWheel = (event: WheelEvent): void => {
+    event.preventDefault();
+
+    const rect = this.state.canvas.value?.getBoundingClientRect();
+    if (!rect) return;
+
+    const centerX = event.clientX - rect.left;
+    const centerY = event.clientY - rect.top;
+
+    const zoomFactor = event.deltaY > 0 ? 0.9 : 1.1;
+    this.engine.smoothZoom(zoomFactor, centerX, centerY);
+  };
+
+  // Touch events
+  handleTouchStart = (event: TouchEvent): void => {
+    event.preventDefault();
+
+    if (event.touches.length === 1) {
+      const touch = event.touches[0];
+      this.useSelectTarget(touch);
+      this.state.touchState.value.lastPos = { x: touch.clientX, y: touch.clientY };
+      this.state.isDragging.value = true;
+      return;
+    }
+
+    if (event.touches.length === 2) {
+      const touch1 = event.touches[0];
+      const touch2 = event.touches[1];
+
+      this.state.touchState.value.startDist = Math.hypot(
+        touch1.clientX - touch2.clientX,
+        touch1.clientY - touch2.clientY
+      );
+      this.state.touchState.value.startZoom = this.engine.getSmoothTransform().getCurrent().scale;
+      this.state.touchState.value.startPos = {
+        x: (touch1.clientX + touch2.clientX) / 2,
+        y: (touch1.clientY + touch2.clientY) / 2,
+      };
+
+      this.state.touchState.value.lastPosMulti = {
+        x: (touch1.clientX + touch2.clientX) / 2,
+        y: (touch1.clientY + touch2.clientY) / 2,
+      };
+
+      this.state.touchState.value.active = true;
+      this.state.isDragging.value = false;
+      return;
+    }
+  };
+
+  handleTouchMove = (event: TouchEvent): void => {
+    event.preventDefault();
+
+    if ((this.state.isSettingYaw.value || this.state.isSettingArea) && event.touches.length === 1) {
+      if (!this.state.canvas.value) return;
+      this.useSelectTargetMove(event.touches[0]);
+      //console.log("hey u touch")
+      return;
+    }
+
+    if (event.touches.length === 1 && this.state.isDragging.value) {
+      const touch = event.touches[0];
+      const dx = touch.clientX - this.state.touchState.value.lastPos.x;
+      const dy = touch.clientY - this.state.touchState.value.lastPos.y;
+
+      const currentTransform = this.engine.getSmoothTransform().getCurrent();
+      this.engine.getSmoothTransform().setTarget({
+        translateX: currentTransform.translateX + dx,
+        translateY: currentTransform.translateY + dy,
+      });
+
+      this.state.touchState.value.lastPos = { x: touch.clientX, y: touch.clientY };
+      return;
+    }
+
+    if (event.touches.length === 2 && this.state.touchState.value.active) {
+      const touch1 = event.touches[0];
+      const touch2 = event.touches[1];
+
+      const currentDist = Math.hypot(
+        touch1.clientX - touch2.clientX,
+        touch1.clientY - touch2.clientY
+      );
+
+      const zoomFactor = currentDist / this.state.touchState.value.startDist;
+      const newScale = Math.max(
+        this.state.minZoom,
+        Math.min(this.state.maxZoom, this.state.touchState.value.startZoom * zoomFactor)
+      );
+
+      const centerX = (touch1.clientX + touch2.clientX) / 2;
+      const centerY = (touch1.clientY + touch2.clientY) / 2;
+
+      this.state.touchDiffPos.value.dx = centerX - this.state.touchState.value.lastPosMulti.x;
+      this.state.touchDiffPos.value.dy = centerY - this.state.touchState.value.lastPosMulti.y;
+
+      const currentTransform = this.engine.getSmoothTransform().getCurrent();
+      this.engine.getSmoothTransform().setTarget({
+        scale: newScale,
+        translateX: currentTransform.translateX + this.state.touchDiffPos.value.dx,
+        translateY: currentTransform.translateY + this.state.touchDiffPos.value.dy,
+      });
+
+      this.state.touchState.value.lastPosMulti = { x: centerX, y: centerY };
+      return;
+    }
+  };
+
+  handleTouchEnd = (event: TouchEvent): void => {
+    event.preventDefault();
+
+    if ((this.state.isSettingYaw.value || this.state.isSettingArea) && event.touches.length === 0) {
+      this.useSelectTargetEnd();
+      return;
+    }
+
+    if (event.touches.length === 0) {
+      this.state.isDragging.value = false;
+      this.state.touchState.value.active = false;
+      return;
+    }
+
+    if (event.touches.length === 1) {
+      const touch = event.touches[0];
+      this.state.touchState.value.active = false;
+      this.state.touchState.value.lastPos = { x: touch.clientX, y: touch.clientY };
+      this.state.isDragging.value = true;
+    }
+  };
+
+  // Goal selection helpers
+  private useSelectTarget(event: MouseEvent | Touch): void {
+    const rect = this.state.canvas.value!.getBoundingClientRect();
+    const worldPos = this.engine.canvasToWorld(
+      event.clientX - rect.left,
+      event.clientY - rect.top
+    );
+    this.state.cursorPosition.value.x = event.clientX - rect.left;
+    this.state.cursorPosition.value.y = -(event.clientY - rect.top);
+    
+    if (this.state.activeTool.value !== 'cursor' && this.state.activeTool.value !== 'area') {
+      this.state.showTargetAngle.value = true;
+      this.state.selectGoal.value = { x: worldPos.x, y: worldPos.y - 0.25, yaw: 0 };
+      this.state.isSettingYaw.value = true;
+      this.state.yawPreview.value = 0;
+      this.state.isSettingArea.value = false;
+      this.engine.forceRedraw();
+    } else if (this.state.activeTool.value === 'area') {
+      this.state.selectGoal.value = { x: worldPos.x, y: worldPos.y, yaw: 0 };
+      this.state.areaStartWorld.value = { x: worldPos.x, y: worldPos.y };
+      this.state.areaPreviewWorld.value = { x: worldPos.x, y: worldPos.y };
+      this.state.isSettingArea.value = true;
+      //console.log("areaMode activated")
+      this.engine.forceRedraw();
+
+    } else {
+      this.state.isDragging.value = true;
+      this.state.lastPointerPos.value = { x: event.clientX, y: event.clientY };
+    }
+  }
+
+  private useSelectTargetMove(event: MouseEvent | Touch): void {
+    const rect = this.state.canvas.value!.getBoundingClientRect();
+    const cx = event.clientX - rect.left;
+    const cy = -(event.clientY - rect.top);
+    const pos = this.engine.worldToCanvas(this.state.selectGoal.value.x, this.state.selectGoal.value.y);
+    const world = this.engine.canvasToWorld(cx, -cy);
+
+    this.state.cursorPosition.value.x = cx;
+    this.state.cursorPosition.value.y = cy;
+    pos.y = -pos.y;
+
+    this.state.yawPreview.value = Math.atan2(cy - pos.y, cx - pos.x);
+
+    if (this.state.isSettingArea.value) {
+      this.state.areaPreviewWorld.value = { x: world.x, y: world.y };
+      //console.log("u touchme")
+      this.engine.forceRedraw();
+      return;
+    }
+
+    this.engine.forceRedraw();
+  }
+
+  private useSelectTargetEnd(): void {
+    if (this.state.isSettingYaw.value) {
+      this.state.selectGoal.value.yaw = this.state.yawPreview.value;
+      this.state.isSettingYaw.value = false;
+      this.state.showTargetAngle.value = false;
+      this.sendPositionGoal(this.state.activeTool.value);
+      this.engine.forceRedraw();
+    } else if (this.state.isSettingArea.value) {
+      this.state.isSettingArea.value = false;
+
+      const start = this.state.areaStartWorld.value;
+      const end = this.state.areaPreviewWorld.value;
+
+      if (start && end) {
+        const p1 = { x: Math.min(start.x, end.x), y: Math.min(start.y, end.y) };
+        const p2 = { x: Math.max(start.x, end.x), y: Math.max(start.y, end.y) };
+
+        this.state.areaRects.value.push({
+          id: `rect_${Date.now()}`,
+          p1,
+          p2,
+          color: this.state.activeRectColor.value || '#22c55e',
+        });
+      }
+      this.state.isSettingArea.value = false;
+      this.state.areaStartWorld.value = null;
+      this.state.areaPreviewWorld.value = null;
+
+      this.engine.forceRedraw();
+    }
+  }
+
+  private sendPositionGoal(mode: ToolType): void {
+    if (mode === 'ptp') {
+      this.state.singleGoal.value = this.state.selectGoal.value;
+      this.socketClient.sendGoalCommand(this.state.singleGoal.value);
+    } else if (mode === 'mptp') {
+      this.state.multiGoal.value.push(this.state.selectGoal.value);
+      this.socketClient.sendGoalCommand(this.state.multiGoal.value);
+    }
+    //console.log('sendPositionGoal');
+  }
+}

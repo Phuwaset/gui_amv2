@@ -1,0 +1,1552 @@
+<template>
+
+  <div class="main-container">
+    <div class="map-container">
+
+      <div v-if="!showStatusState" class="status" :class="{ connected: isConnected, disconnected: !isConnected }">
+        {{ isConnected ? 'Connected' : 'Disconnected (Try again ?)' }}
+      </div>
+
+      <div v-if="showStatusState">
+
+        <ToolboxComponent v-model="activeTool" :enableHotkeys="true" :show="true" orientation="horizontal" />
+
+      </div>
+
+
+      <div class="canvas-container" ref="canvasContainer" @wheel="handleWheel" @touchstart="handleTouchStart"
+        @touchmove="handleTouchMove" @touchend="handleTouchEnd" @mousedown="handleMouseDown"
+        @mousemove="handleMouseMove" @mouseup="handleMouseUp" @mouseleave="handleMouseUp">
+        <!-- @click="handleGoalClick" -->
+        <canvas ref="canvas" :width="canvasWidth" :height="canvasHeight" class="main-canvas"
+          :style="{ cursor: (activeTool === 'ptp' || activeTool == 'mptp') ? 'crosshair' : (activeTool === 'cursor' ? 'pointer' : 'default') }">
+        </canvas>
+
+        <div class="layer-controls" v-if="showDebugControls">
+          <label>
+            <input type="checkbox" v-model="layerVisibility.map" @change="forceRedraw"> Map
+          </label>
+          <label>
+            <input type="checkbox" v-model="layerVisibility.robot" @change="forceRedraw"> Robot
+          </label>
+          <label>
+            <input type="checkbox" v-model="layerVisibility.target" @change="forceRedraw"> Target
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="joystick-container" :style="{ bottom: joystickBottomPosition + 'px' }">
+      <JoystickComponent @updateVelocity="handleVelocity" />
+      <!-- <p>Velocity X: {{ Vx.toFixed(2) }}</p>
+      <p>Velocity Y: {{ Vy.toFixed(2) }}</p>
+    -->
+    </div>
+
+    <div class="zoom-container">
+      <div class="zoom-controls">
+        <button @click="zoomIn" :disabled="zoomLevel >= maxZoom">+</button>
+        <button @click="zoomOut" :disabled="zoomLevel <= minZoom">-</button>
+      </div>
+      <div class="zoom-size">
+        Size: {{ zoomLevel.toFixed(1) }}
+      </div>
+      <div class="performance-info" v-if="showPerformanceInfo">
+        <div>FPS: {{ currentFPS }}</div>
+        <!-- <div>Frame Time: {{ averageFrameTime.toFixed(1) }}ms</div> -->
+        <!-- <div>Frame: {{ renderedFrames }}</div> -->
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import JoystickComponent from 'components/assets/joystick/JoystickAsset.vue';
+import ToolboxComponent, { type ToolType } from '../map/toolbox/ToolBox.vue'
+import type { OccupancyGrid, Transform } from './interfaces/map_interface';
+import './css/MapAsset.css'
+import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue';
+import type { IPosition } from 'src/interfaces/robot_interfaces';
+import { payloadAction } from 'src/interfaces/socket_interface';
+import { server_websocket_config } from 'src/configs/server';
+
+
+const activeTool = ref<ToolType>('cursor');
+
+// Goal pose yaw selection
+const isSettingYaw = ref(false);   // กำลังเลือก yaw อยู่หรือไม่
+const isSettingArea = ref(false);
+const cursorPosition = ref<{x: number; y:number}>({x:0,y:0});
+const yawPreview = ref(0);         // yaw ชั่วคราวตอนลาก
+
+const showConnected = ref(false);
+const showStatusState = ref(false);
+const showTargetAngle = ref(false);
+
+
+// Canvas and rendering refs
+
+const canvas = ref<HTMLCanvasElement | null>(null);
+
+const canvasContainer = ref<HTMLElement | null>(null);
+const canvasWidth = ref(1080);
+const canvasHeight = ref(1080);
+
+// Map data and state
+// eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents
+const mapData = ref<OccupancyGrid | null>(null);
+const robotPosition = ref<{ x: number; y: number, yaw: number }>({ x: 0, y: 0, yaw: 0 });
+const selectGoal = ref<IPosition>({ x: 0, y: 0, yaw: 0 });
+const singleGoal = ref<IPosition>({ x: 0, y: 0, yaw: 0 });
+const multiGoal = ref<IPosition[]>([
+  { x: 0, y: 0, yaw: 0 }
+]);
+const multiGoalUpdate = ref(false);
+
+const isConnected = ref(false);
+
+// Transform and interaction state
+const transform = ref<Transform>({ scale: 1.0, translateX: 0, translateY: 0 });
+const zoomLevel = ref(1.0);
+// const CameraMoveVel = ref(1.0)
+const minZoom = 0.1;
+const maxZoom = 10.0;
+const isDragging = ref(false);
+const lastPointerPos = ref({ x: 0, y: 0 });
+
+// Resolution-aware state - NEW
+const previousCanvasSize = ref({ width: 0, height: 0 });
+const mapCenterWorld = ref({ x: 0, y: 0 }); // Track world center point
+
+// Touch handling
+const touchState = ref({
+  active: false,
+  startDist: 0,
+  startZoom: 1.0,
+  startPos: { x: 0, y: 0 },
+  lastPos: { x: 0, y: 0 },
+  lastPosMulti: { x: 0, y: 0 },
+});
+
+
+// 
+const touchDiffPos = ref({
+  dx: 0,
+  dy: 0,
+  timeDiff: 0,
+  timePrev: 0
+})
+
+
+
+// Velocity control
+const Vx = ref(0);
+const Vy = ref(0);
+
+// Performance and rendering state
+const showDebugControls = ref(false);
+const showPerformanceInfo = ref(true);
+const currentFPS = ref(0);
+const averageFrameTime = ref(0);
+const renderedFrames = ref(0);
+
+// Layer management
+const layerVisibility = ref({
+  map: true,
+  robot: true,
+  target: true
+});
+
+// Optimized rendering system
+const renderState = {
+  mapImageData: null as ImageData | null,
+  mapTexture: null as HTMLCanvasElement | null,
+  lastMapHash: '',
+  lastRobotState: { x: 0, y: 0, yaw: 0, hash: '' },
+  lastTargetState: { x: 0, y: 0, yaw: 0, hash: '' },
+  needsFullRedraw: true,
+  animationFrameId: 0
+};
+
+// Performance monitoring
+const performanceState = {
+  frameCount: 0,
+  lastFPSTime: performance.now(),
+  frameTimes: [] as number[],
+  lastFrameTime: performance.now()
+};
+
+// WebSocket
+let ws: WebSocket | null = null;
+let reconnectTimeout: number | null = null;
+
+// Computed properties
+const joystickBottomPosition = computed(() => 20);
+
+
+// Fixed sections of your Vue component
+
+
+watch(isConnected, (val) => {
+  if (val) {
+    showConnected.value = true;
+    showStatusState.value = false;
+    setTimeout(() => {
+      if (isConnected.value) {
+        showStatusState.value = true;
+      }
+      showConnected.value = false;
+    }, 2000); // 2 วินาทีแล้วซ่อน
+  }
+});
+
+// FIXED: World coordinate utilities with proper bounds checking
+const worldToCanvas = (worldX: number, worldY: number) => {
+  if (!mapData.value) return { x: 0, y: 0 };
+
+  const { resolution, origin_x, origin_y, height } = mapData.value;
+
+  // Convert world to map pixel coordinates
+  const mapPixelX = (worldX - origin_x) / resolution;
+  const mapPixelY = (origin_y + height * resolution - worldY) / resolution;
+
+  // Apply transform to get canvas coordinates
+  const canvasX = mapPixelX * transform.value.scale + transform.value.translateX;
+  const canvasY = mapPixelY * transform.value.scale + transform.value.translateY;
+
+  return { x: canvasX, y: canvasY };
+};
+
+const canvasToWorld = (canvasX: number, canvasY: number) => {
+  if (!mapData.value) return { x: 0, y: 0 };
+
+  const { resolution, origin_x, origin_y, height } = mapData.value;
+
+  // Convert canvas to map pixel coordinates
+  const mapPixelX = (canvasX - transform.value.translateX) / transform.value.scale;
+  const mapPixelY = (canvasY - transform.value.translateY) / transform.value.scale;
+
+  // Convert to world coordinates
+  const worldX = origin_x + mapPixelX * resolution;
+  const worldY = origin_y + (height - mapPixelY) * resolution;
+
+  return { x: worldX, y: worldY };
+};
+
+// FIXED: Proper resolution-aware transform adjustment
+const adjustTransformForResize = (oldWidth: number, oldHeight: number, newWidth: number, newHeight: number) => {
+  if (!mapData.value || oldWidth === 0 || oldHeight === 0) return;
+
+  // Get the current center point of the view in world coordinates
+  const oldCenterX = oldWidth / 2;
+  const oldCenterY = oldHeight / 2;
+
+  // Convert current center to world coordinates BEFORE transform changes
+  const worldCenter = canvasToWorld(oldCenterX, oldCenterY);
+
+  // Calculate where this world point should be on the new canvas
+  const newCenterX = newWidth / 2;
+  const newCenterY = newHeight / 2;
+
+  // Convert world center back to map pixel coordinates
+  const { resolution, origin_x, origin_y, height } = mapData.value;
+  const mapPixelX = (worldCenter.x - origin_x) / resolution;
+  const mapPixelY = (origin_y + height * resolution - worldCenter.y) / resolution;
+
+  // Calculate new translation to keep the same world point centered
+  const newTranslateX = newCenterX - mapPixelX * transform.value.scale;
+  const newTranslateY = newCenterY - mapPixelY * transform.value.scale;
+
+  // Apply the new transform immediately (no animation for resize)
+  transform.value = {
+    scale: transform.value.scale,
+    translateX: newTranslateX,
+    translateY: newTranslateY
+  };
+
+  // Update smooth transform state
+  smoothTransform.setCurrent(transform.value);
+
+  //console.log('Transform adjusted for resize:', {
+    oldSize: { width: oldWidth, height: oldHeight },
+    newSize: { width: newWidth, height: newHeight },
+    worldCenter,
+    newTransform: transform.value
+  });
+};
+
+// FIXED: Enhanced canvas resize handling with proper state management
+const handleResize = () => {
+  if (!canvasContainer.value) return;
+
+  const container = canvasContainer.value;
+  const rect = container.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+
+  // Store previous canvas size for transform adjustment
+  const oldWidth = canvasWidth.value;
+  const oldHeight = canvasHeight.value;
+
+  // Calculate new display size with mobile considerations
+  let newWidth = Math.floor(rect.width);
+  let newHeight = Math.floor(rect.height);
+
+  // Mobile viewport adjustments
+  const isMobile = window.innerWidth <= 768;
+  if (isMobile) {
+    // Account for mobile browsers' dynamic viewport
+    const vh = window.innerHeight * 0.01;
+    document.documentElement.style.setProperty('--vh', `${vh}px`);
+
+    // Ensure minimum canvas size on mobile
+    newWidth = Math.max(newWidth, 300);
+    newHeight = Math.max(newHeight, 400);
+  }
+
+  // Only proceed if size actually changed
+  if (newWidth === oldWidth && newHeight === oldHeight) {
+    return;
+  }
+
+  // Update canvas size
+  canvasWidth.value = newWidth;
+  canvasHeight.value = newHeight;
+
+  if (canvas.value) {
+    const effectiveDpr = isMobile ? Math.min(dpr, 2) : dpr;
+
+    // Set display size
+    canvas.value.style.width = `${newWidth}px`;
+    canvas.value.style.height = `${newHeight}px`;
+
+    // Set actual canvas resolution
+    canvas.value.width = Math.floor(newWidth * effectiveDpr);
+    canvas.value.height = Math.floor(newHeight * effectiveDpr);
+
+    // Scale context to match device pixel ratio
+    const ctx = canvas.value.getContext('2d');
+    if (ctx) {
+      ctx.scale(effectiveDpr, effectiveDpr);
+    }
+  }
+
+  // Adjust transform to maintain the same view after resize
+  if (oldWidth > 0 && oldHeight > 0 && mapData.value) {
+    adjustTransformForResize(oldWidth, oldHeight, newWidth, newHeight);
+  }
+
+  // Update previous size tracking
+  previousCanvasSize.value = { width: newWidth, height: newHeight };
+
+  // Force a redraw
+  forceRedraw();
+
+  //console.log('Canvas resized:', {
+    from: { width: oldWidth, height: oldHeight },
+    to: { width: newWidth, height: newHeight },
+    isMobile
+  });
+};
+
+// FIXED: Enhanced smooth transform system with better state management
+const smoothTransform = (() => {
+  let targetTransform = { scale: 1, translateX: 0, translateY: 0 };
+  let currentTransform = { scale: 1, translateX: 0, translateY: 0 };
+  let isAnimating = false;
+
+  const lerp = (start: number, end: number, factor: number) =>
+    start + (end - start) * factor;
+
+  const animate = () => {
+    const lerpFactor = 0.15;
+
+    const prevTransform = { ...currentTransform };
+
+    currentTransform.scale = lerp(currentTransform.scale, targetTransform.scale, lerpFactor);
+    currentTransform.translateX = lerp(currentTransform.translateX, targetTransform.translateX, lerpFactor);
+    currentTransform.translateY = lerp(currentTransform.translateY, targetTransform.translateY, lerpFactor);
+
+    // Check if animation is complete
+    const threshold = 0.001;
+    const scaleComplete = Math.abs(currentTransform.scale - targetTransform.scale) < threshold;
+    const translateXComplete = Math.abs(currentTransform.translateX - targetTransform.translateX) < 1;
+    const translateYComplete = Math.abs(currentTransform.translateY - targetTransform.translateY) < 1;
+
+    if (scaleComplete && translateXComplete && translateYComplete) {
+      currentTransform = { ...targetTransform };
+      isAnimating = false;
+    } else {
+      requestAnimationFrame(animate);
+    }
+
+    // Update reactive ref
+    transform.value = { ...currentTransform };
+    zoomLevel.value = currentTransform.scale;
+
+    // Trigger redraw if transform changed significantly
+    const transformChanged =
+      Math.abs(prevTransform.scale - currentTransform.scale) > 0.001 ||
+      Math.abs(prevTransform.translateX - currentTransform.translateX) > 0.5 ||
+      Math.abs(prevTransform.translateY - currentTransform.translateY) > 0.5;
+
+    if (transformChanged) {
+      scheduleRender();
+    }
+  };
+
+  return {
+    setTarget: (newTransform: Partial<Transform>) => {
+      targetTransform = { ...targetTransform, ...newTransform };
+      if (!isAnimating) {
+        isAnimating = true;
+        requestAnimationFrame(animate);
+      }
+    },
+    setCurrent: (newTransform: Transform) => {
+      currentTransform = { ...newTransform };
+      targetTransform = { ...newTransform };
+      transform.value = { ...newTransform };
+      zoomLevel.value = newTransform.scale;
+      isAnimating = false; // Stop any ongoing animation
+    },
+    getCurrent: () => ({ ...currentTransform }),
+    getTarget: () => ({ ...targetTransform }),
+    isAnimating: () => isAnimating
+  };
+})();
+
+// FIXED: Auto-fit map with proper initial centering
+const autoFitMap = () => {
+  if (!mapData.value || !canvas.value) return;
+
+  const { width: mapWidth, height: mapHeight } = mapData.value;
+  const canvasAspect = canvasWidth.value / canvasHeight.value;
+  const mapAspect = mapWidth / mapHeight;
+
+  // Calculate scale to fit map with padding
+  let scale: number;
+  const padding = 0.9; // 90% of canvas size
+
+  if (mapAspect > canvasAspect) {
+    // Map is wider - fit to width
+    scale = (canvasWidth.value * padding) / mapWidth;
+  } else {
+    // Map is taller - fit to height
+    scale = (canvasHeight.value * padding) / mapHeight;
+  }
+
+  // Center the map on canvas
+  const centerX = canvasWidth.value / 2 - (mapWidth * scale) / 2;
+  const centerY = canvasHeight.value / 2 - (mapHeight * scale) / 2;
+
+  const initialTransform = {
+    scale: scale,
+    translateX: centerX,
+    translateY: centerY
+  };
+
+  // Set transform immediately without animation
+  smoothTransform.setCurrent(initialTransform);
+
+  // Store the canvas size for future resize adjustments
+  previousCanvasSize.value = { width: canvasWidth.value, height: canvasHeight.value };
+
+  //console.log('Auto-fit map:', {
+    mapSize: { width: mapWidth, height: mapHeight },
+    canvasSize: { width: canvasWidth.value, height: canvasHeight.value },
+    scale,
+    transform: initialTransform
+  });
+
+  scheduleRender();
+};
+
+const smoothZoom = (factor: number, centerX?: number, centerY?: number) => {
+  const currentTransform = smoothTransform.getCurrent();
+  const newScale = Math.max(minZoom, Math.min(maxZoom, currentTransform.scale * factor));
+
+  if (Math.abs(newScale - currentTransform.scale) < 0.001) return;
+
+  if (centerX !== undefined && centerY !== undefined) {
+    // Zoom to specific point
+    const scaleRatio = newScale / currentTransform.scale;
+    const newTranslateX = centerX - (centerX - currentTransform.translateX) * scaleRatio;
+    const newTranslateY = centerY - (centerY - currentTransform.translateY) * scaleRatio;
+
+    smoothTransform.setTarget({
+      scale: newScale,
+      translateX: newTranslateX,
+      translateY: newTranslateY
+    });
+  } else {
+    // Zoom to canvas center
+    const centerX = canvasWidth.value / 2;
+    const centerY = canvasHeight.value / 2;
+    const scaleRatio = newScale / currentTransform.scale;
+
+    const newTranslateX = centerX - (centerX - currentTransform.translateX) * scaleRatio;
+    const newTranslateY = centerY - (centerY - currentTransform.translateY) * scaleRatio;
+
+    smoothTransform.setTarget({
+      scale: newScale,
+      translateX: newTranslateX,
+      translateY: newTranslateY
+    });
+  }
+};
+
+
+// Optimized map texture generation
+const generateMapTexture = (mapData: OccupancyGrid): HTMLCanvasElement => {
+  const { width, height, data } = mapData;
+
+  // Create offscreen canvas for map texture
+  const textureCanvas = document.createElement('canvas');
+  textureCanvas.width = width;
+  textureCanvas.height = height;
+
+  const ctx = textureCanvas.getContext('2d', {
+    alpha: false,
+    desynchronized: true
+  });
+  if (!ctx) throw new Error('Failed to get canvas context');
+
+  // Disable smoothing for pixel-perfect rendering
+  ctx.imageSmoothingEnabled = false;
+
+  // Generate optimized image data
+  const imgData = ctx.createImageData(width, height);
+  const imgArray = imgData.data;
+
+  // Optimized color mapping with lookup table
+  const colorLUT = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    if (i === 255) colorLUT[i] = 127; // Unknown (-1 mapped to 255)
+    else if (i === 0) colorLUT[i] = 240; // Free space
+    else if (i === 100) colorLUT[i] = 0; // Occupied
+    else colorLUT[i] = Math.max(0, 255 - i * 2.55); // Probability
+  }
+
+  // Vectorized pixel processing
+  for (let i = 0; i < data.length; i++) {
+    const val = data[i] === -1 ? 255 : Math.max(0, Math.min(255, data[i]));
+    const color = colorLUT[val];
+
+    const x = i % width;
+    const y = Math.floor(i / width);
+    const flippedY = height - 1 - y; // Flip Y-axis
+
+    const pixelIndex = (flippedY * width + x) * 4;
+    imgArray[pixelIndex] = color;     // R
+    imgArray[pixelIndex + 1] = color; // G
+    imgArray[pixelIndex + 2] = color; // B
+    imgArray[pixelIndex + 3] = 255;   // A
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return textureCanvas;
+};
+
+const render = () => {
+
+  if (!canvas.value || !mapData.value) return;
+
+  const startTime = performance.now();
+  const ctx = canvas.value.getContext('2d', {
+    alpha: false,
+    desynchronized: true
+  });
+  if (!ctx) return;
+
+  // Clear canvas
+  ctx.clearRect(0, 0, canvasWidth.value, canvasHeight.value);
+
+  // Set transform for the map layer
+  ctx.save();
+  // The redundant scaling call was removed from here.
+  ctx.translate(transform.value.translateX, transform.value.translateY);
+  ctx.scale(transform.value.scale, transform.value.scale);
+
+  // Render map layer
+  if (layerVisibility.value.map && renderState.mapTexture) {
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(renderState.mapTexture, 0, 0);
+  }
+
+  ctx.restore();
+
+  // Render UI elements (robot, target) without the map's transform
+  if (layerVisibility.value.robot) {
+    drawRobot(ctx);
+  }
+
+  if (layerVisibility.value.target) {
+    if (activeTool.value == 'mptp') {
+      drawTarget(ctx);
+      drawMultiTarget(ctx);
+    }
+    else {
+      drawTarget(ctx);
+      drawSingleTarget(ctx);
+      drawMultiTarget(ctx);
+    }
+
+  }
+
+  // Performance tracking
+  const frameTime = performance.now() - startTime;
+  updatePerformanceStats(frameTime);
+
+  renderedFrames.value++;
+  renderState.needsFullRedraw = false;
+};
+
+
+// UPDATED: Efficient robot rendering with proper coordinate conversion
+const drawRobot = (ctx: CanvasRenderingContext2D) => {
+  if (!robotPosition.value || !mapData.value) return;
+
+  const { x, y, yaw } = robotPosition.value;
+  const canvasPos = worldToCanvas(x, y);
+
+  ctx.save();
+  ctx.translate(canvasPos.x, canvasPos.y);
+  ctx.rotate(yaw);
+
+  // Draw robot triangle
+  const size = Math.max(8, 12 * transform.value.scale);
+  const halfSize = size / 2;
+
+  ctx.fillStyle = '#00ff00';
+  ctx.beginPath();
+  ctx.moveTo(0, -size);
+  ctx.lineTo(-halfSize, halfSize);
+  ctx.lineTo(halfSize, halfSize);
+  ctx.closePath();
+  ctx.fill();
+
+  // Draw detection circle
+  const circleRadius = Math.max(16, 20 * transform.value.scale);
+  ctx.fillStyle = 'rgba(0, 255, 0, 0.2)';
+  ctx.beginPath();
+  ctx.arc(0, 0, circleRadius, 0, 2 * Math.PI);
+  ctx.fill();
+
+  ctx.restore();
+};
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const createMultiPoint = (position_x: number, position_y: number, yaw: number) => {
+  multiGoal.value.push({ x: position_x, y: position_y, yaw });
+  // //console.log(multiGoal);
+}
+
+const clearMultiPoint = () => {
+  multiGoal.value = []
+}
+
+
+
+
+
+const drawTarget = (ctx: CanvasRenderingContext2D) => {
+  if (!selectGoal.value || !mapData.value) return;
+  const { x, y } = selectGoal.value;
+  const canvasPos = worldToCanvas(x, y);
+
+  ctx.save();
+  ctx.translate(canvasPos.x, canvasPos.y);
+
+  const markerSize = Math.max(8, 12 * Math.sqrt(transform.value.scale));
+  const r = markerSize * 3;                 // radius for guides
+  const cx = 0;                             // center X (canvas space, local)
+  const cy = -markerSize;                   // center Y (just above pin tip)
+
+  // which yaw to render (preview during hold)
+  const rawYaw = isSettingYaw.value ? yawPreview.value : selectGoal.value.yaw;
+  const yawToDraw = rawYaw
+
+
+  const toX = cx + Math.cos(yawToDraw) * r;
+  const toY = -((cy) + Math.sin(-yawToDraw) * r);
+
+
+  if (!isNaN(yawToDraw)) {
+    // ===== quadrant + ticks + angle hints (only while holding) =====x
+    if (isSettingYaw.value) {
+
+      // base marker (pin)
+      ctx.fillStyle = '#ff0044';
+      ctx.beginPath();
+      ctx.arc(0, -markerSize, markerSize * 0.8, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.arc(0, -markerSize, markerSize * 0.3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // dashed circle
+      ctx.strokeStyle = 'rgb a(0,0,0,0.35)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // crosshair (quadrants)
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); // horizontal
+      ctx.moveTo(cx - r, cy);
+      ctx.lineTo(cx + r, cy);
+      ctx.stroke();
+      ctx.beginPath(); // vertical
+      ctx.moveTo(cx, cy - r);
+      ctx.lineTo(cx, cy + r);
+      ctx.stroke();
+
+      // ticks every 15°, longer at 45°/90°/… (major)
+      const minorLen = Math.max(4, markerSize * 0.25);
+      const majorLen = Math.max(7, markerSize * 0.4);
+      for (let deg = 0; deg < 360; deg += 15) {
+        const rad = (deg * Math.PI) / 180;
+        const isMajor = deg % 45 === 0;
+        const len = isMajor ? majorLen : minorLen;
+
+        const sx = cx + Math.cos(rad) * (r - len);
+        const sy = cy + Math.sin(rad) * (r - len);
+        const ex = cx + Math.cos(rad) * (r + (isMajor ? 0 : 0)); // ticks point inward
+        const ey = cy + Math.sin(rad) * (r + (isMajor ? 0 : 0));
+
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+      }
+
+      // angle labels for 0°, 90°, 180°, 270°
+      const labelFont = `${Math.max(11, markerSize * 0.7)}px Arial`;
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.font = labelFont;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      // 0° (to the right)
+      ctx.fillText('0°', cx + r + Math.max(10, markerSize * 0.4), cy);
+      // 90° (up)
+      ctx.fillText('90°', cx, cy - r - Math.max(10, markerSize * 0.4));
+      // 180° (left)
+      ctx.fillText('180°', cx - r - Math.max(14, markerSize * 0.6), cy);
+      // 270° (down)
+      ctx.fillText('270°', cx, cy + r + Math.max(10, markerSize * 0.4));
+
+      // sweep arc from 0° → current yaw (0..360)
+      let yawDegSweep = (yawToDraw * 180) / Math.PI;
+      if (yawDegSweep < 0) yawDegSweep += 360;
+      const yawRadSweep = (yawDegSweep * Math.PI) / 180;
+
+      ctx.strokeStyle = 'rgba(255,0,68,0.35)';
+      ctx.lineWidth = Math.max(2, markerSize * 0.15);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, -yawRadSweep, false); // clockwise from +X
+      ctx.stroke();
+
+      // // ===== RViz-like arrow from center to yaw direction =====
+      ctx.strokeStyle = '#ff0044';
+      ctx.fillStyle = '#ff0044';
+      ctx.lineWidth = 2;
+
+      // //console.log(`Arrow : [${cx.toFixed(2)},${cy.toFixed(2)}] -> [${toX.toFixed(2)},${toY.toFixed(2)}]`)
+      // main shaft
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(toX, -toY);
+      ctx.stroke();
+
+      // arrow head
+      const headLength = 5 * transform.value.scale;
+      const ang = Math.atan2((toY - (-cy)), toX - cx);
+      ctx.beginPath();
+      ctx.moveTo(toX, -toY);
+      ctx.lineTo(
+        toX - headLength * Math.cos(ang - Math.PI / 6),
+        -(toY - headLength * Math.sin(ang - Math.PI / 6))
+      );
+      ctx.lineTo(
+        toX - headLength * Math.cos(ang + Math.PI / 6),
+        -(toY - headLength * Math.sin(ang + Math.PI / 6))
+      );
+      ctx.closePath();
+      ctx.fill();
+
+      let yawDeg = (((yawToDraw * 180) / Math.PI)) % 360;
+
+      if (yawDeg < 0) yawDeg += 360; // 0–360
+      const yawText = `${yawDeg.toFixed(1)}°`;
+
+      ctx.fillStyle = '#000000';
+      ctx.font = `${Math.max(12, markerSize * 0.8)}px Arial`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(yawText, 0, markerSize * 0.5);
+    }
+    else if (isSettingArea.value) {
+      ctx.beginPath();
+      ctx.rect(cx, cy, (cursorPosition.value.x - canvasPos.x), (-(cursorPosition.value.y) - canvasPos.y));
+
+      //console.log(`position:${cursorPosition.value.x -cx} , ${-(cursorPosition.value.y - cy)}`)
+      // cursorP
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+};
+
+const drawSingleTarget = (ctx: CanvasRenderingContext2D) => {
+  if (!singleGoal.value || !mapData.value) return;
+  const { x, y, yaw } = singleGoal.value;
+
+  const canvasPos = worldToCanvas(x, y);
+
+  ctx.save();
+  ctx.translate(canvasPos.x, canvasPos.y);
+
+  const markerSize = Math.max(8, 12 * Math.sqrt(transform.value.scale));
+  const r = markerSize * 3;                 // radius for guides
+  const cx = 0;                             // center X (canvas space, local)
+  const cy = -markerSize;                   // center Y (just above pin tip)
+
+  // base marker (pin)
+  ctx.fillStyle = '#ff0044';
+  ctx.beginPath();
+  ctx.arc(0, -markerSize, markerSize * 0.8, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath();
+  ctx.arc(0, -markerSize, markerSize * 0.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  const yawToDraw = yaw;
+  // arrow
+  ctx.strokeStyle = '#ff0044';
+  ctx.fillStyle = '#ff0044';
+  ctx.lineWidth = 2;
+
+  const toX = cx + Math.cos(yawToDraw) * r;
+  const toY = -((cy) + Math.sin(-yawToDraw) * r);
+
+  // main shaft
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(toX, -toY);
+  ctx.stroke();
+
+  // arrow head
+  const headLength = 5 * transform.value.scale;
+  const ang = Math.atan2((toY - (-cy)), toX - cx);
+  ctx.beginPath();
+  ctx.moveTo(toX, -toY);
+  ctx.lineTo(
+    toX - headLength * Math.cos(ang - Math.PI / 6),
+    -(toY - headLength * Math.sin(ang - Math.PI / 6))
+  );
+  ctx.lineTo(
+    toX - headLength * Math.cos(ang + Math.PI / 6),
+    -(toY - headLength * Math.sin(ang + Math.PI / 6))
+  );
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.restore();
+}
+
+const drawMultiTarget = (ctx: CanvasRenderingContext2D) => {
+  if (!multiGoal.value || !mapData.value) return;
+  const goalLength = multiGoal.value.length;
+
+  for (let i = 0; i < goalLength; i++) {
+    const { x, y, yaw } = multiGoal.value[i];
+
+    const canvasPos = worldToCanvas(x, y);
+
+    ctx.save();
+    ctx.translate(canvasPos.x, canvasPos.y);
+
+    const markerSize = Math.max(8, 12 * Math.sqrt(transform.value.scale));
+    const r = markerSize * 3;                 // radius for guides
+    const cx = 0;                             // center X (canvas space, local)
+    const cy = -markerSize;                   // center Y (just above pin tip)
+
+    // base marker (pin)
+    ctx.fillStyle = '#FFA500';
+    ctx.beginPath();
+    ctx.arc(0, -markerSize, markerSize * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.arc(0, -markerSize, markerSize * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    const yawToDraw = yaw;
+    // arrow
+    ctx.strokeStyle = '#FFA500';
+    ctx.fillStyle = '#FFA500';
+    ctx.lineWidth = 2;
+
+    const toX = cx + Math.cos(yawToDraw) * r;
+    const toY = -((cy) + Math.sin(-yawToDraw) * r);
+
+    // main shaft
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(toX, -toY);
+    ctx.stroke();
+
+    // arrow head
+    const headLength = 5 * transform.value.scale;
+    const ang = Math.atan2((toY - (-cy)), toX - cx);
+    ctx.beginPath();
+    ctx.moveTo(toX, -toY);
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang - Math.PI / 6),
+      -(toY - headLength * Math.sin(ang - Math.PI / 6))
+    );
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang + Math.PI / 6),
+      -(toY - headLength * Math.sin(ang + Math.PI / 6))
+    );
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
+
+  }
+
+
+
+
+}
+
+// Render scheduling
+let renderScheduled = false;
+const scheduleRender = () => {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    render();
+    renderScheduled = false;
+  });
+};
+
+// Force full redraw
+const forceRedraw = () => {
+  renderState.needsFullRedraw = true;
+  scheduleRender();
+};
+
+// Performance monitoring
+const updatePerformanceStats = (frameTime: number) => {
+  performanceState.frameCount++;
+  performanceState.frameTimes.push(frameTime);
+
+  // Keep only last 60 frame times
+  if (performanceState.frameTimes.length > 60) {
+    performanceState.frameTimes.shift();
+  }
+
+  // Update FPS every second
+  const currentTime = performance.now();
+  if (currentTime - performanceState.lastFPSTime >= 1000) {
+    currentFPS.value = Math.round((performanceState.frameCount * 1000) / (currentTime - performanceState.lastFPSTime));
+    performanceState.frameCount = 0;
+    performanceState.lastFPSTime = currentTime;
+
+    // Calculate average frame time
+    const sum = performanceState.frameTimes.reduce((a, b) => a + b, 0);
+    averageFrameTime.value = sum / performanceState.frameTimes.length;
+  }
+};
+
+// NEW: Mobile-specific touch optimization
+const optimizeForMobile = () => {
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+  if (isMobile) {
+    // Disable context menu on long press for better touch UX
+    document.addEventListener('contextmenu', (e) => {
+      if (e.target === canvas.value) {
+        e.preventDefault();
+      }
+    });
+
+    // Prevent elastic scrolling on iOS
+    if (isIOS) {
+      document.body.style.position = 'fixed';
+      document.body.style.width = '100%';
+      document.body.style.height = '100%';
+    }
+
+    // Optimize performance settings for mobile
+    if (canvas.value) {
+      const ctx = canvas.value.getContext('2d');
+      if (ctx) {
+        // Reduce rendering quality slightly for better performance
+        ctx.imageSmoothingQuality = 'low';
+      }
+    }
+
+    // Reduce performance monitoring frequency on mobile
+    showPerformanceInfo.value = false;
+  }
+
+  return isMobile;
+};
+
+// NEW: Prevent zoom on double-tap for iOS Safari
+const preventDoubleZoom = (element: HTMLElement) => {
+  let lastTouchEnd = 0;
+  element.addEventListener('touchend', (event) => {
+    const now = new Date().getTime();
+    if (now - lastTouchEnd <= 300) {
+      event.preventDefault();
+    }
+    lastTouchEnd = now;
+  }, { passive: false });
+};
+
+
+
+const zoomIn = () => smoothZoom(1.25);
+const zoomOut = () => smoothZoom(0.8);
+
+// Event handlers
+
+
+const handleWheel = (event: WheelEvent) => {
+  event.preventDefault();
+
+  const rect = canvas.value?.getBoundingClientRect();
+  if (!rect) return;
+
+  const centerX = event.clientX - rect.left;
+  const centerY = event.clientY - rect.top;
+
+  const zoomFactor = event.deltaY > 0 ? 0.9 : 1.1;
+  smoothZoom(zoomFactor, centerX, centerY);
+};
+
+const useSelectTarget = (event: MouseEvent | Touch) => {
+  const rect = canvas.value!.getBoundingClientRect();
+  const worldPos = canvasToWorld((event.clientX - rect.left), (event.clientY - (rect.top)));
+  cursorPosition.value.x = (event.clientX - rect.left);
+  cursorPosition.value.y = -(event.clientY - (rect.top));
+  if (activeTool.value != 'cursor' && activeTool.value != 'area')  {
+    showTargetAngle.value = true;
+    selectGoal.value = { x: worldPos.x, y: (worldPos.y - 0.25), yaw: 0 };
+    isSettingYaw.value = true;
+    yawPreview.value = 0;
+    scheduleRender();
+  }
+  else if (activeTool.value == 'area') {
+    selectGoal.value = { x: worldPos.x, y: (worldPos.y ), yaw: 0 };
+    isSettingArea.value = true;
+    scheduleRender();
+  }
+  else {
+    // pan camera
+    isDragging.value = true;
+    lastPointerPos.value = { x: event.clientX, y: event.clientY };
+  }
+}
+
+
+const handleMouseDown = (event: MouseEvent) => {
+
+  if (event.button !== 0) return; // left button only
+  useSelectTarget(event);
+};
+
+const useSelectTargetMove = (event: MouseEvent | Touch) => {
+  const rect = canvas.value!.getBoundingClientRect();
+  const cx = event.clientX - rect.left;
+  const cy = -(event.clientY - rect.top);
+  const pos = worldToCanvas(selectGoal.value.x, selectGoal.value.y);
+  
+  cursorPosition.value.x = cx;
+  cursorPosition.value.y = cy;
+  pos.y = (-pos.y);
+  // หมุน yaw preview ตามตำแหน่งเมาส์
+  yawPreview.value = Math.atan2((cy - pos.y), cx - pos.x);
+  // //console.log(`x:${cx-pos.x},y:${cy-pos.y},yaw:${yawPreview.value * 180 / 3.141}`)
+
+  scheduleRender();
+}
+
+const handleMouseMove = (event: MouseEvent) => {
+  if (isSettingYaw.value || isSettingArea.value) {
+
+    useSelectTargetMove(event);
+    return;
+  }
+
+  if (isDragging.value) {
+    const dx = event.clientX - lastPointerPos.value.x;
+    const dy = event.clientY - lastPointerPos.value.y;
+    const currentTransform = smoothTransform.getCurrent();
+    smoothTransform.setTarget({
+      translateX: currentTransform.translateX + dx,
+      translateY: currentTransform.translateY + dy
+    });
+    lastPointerPos.value = { x: event.clientX, y: event.clientY };
+  }
+};
+
+
+const sendPositionPayload = (position: IPosition | IPosition[]) => {
+  let payload = "";
+  if (Array.isArray(position)) {
+    payload = JSON.stringify({
+      action: payloadAction.goal_multi_cmd,
+      position: position,
+    });
+  }
+  else {
+    payload = JSON.stringify({
+      action: payloadAction.goal_cmd,
+      position: position,
+    })
+  }
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(payload);
+  }
+}
+
+const sendPositionGoal = (mode: ToolType) => {
+  if (mode == 'ptp') {
+    singleGoal.value = selectGoal.value;
+    sendPositionPayload(singleGoal.value);
+  }
+  else if (mode == 'mptp') {
+
+    // multiGoalPrevious.value = multiGoal.value;
+
+    multiGoal.value.push(selectGoal.value);
+    // //console.log(multiGoal.value);
+    sendPositionPayload(multiGoal.value);
+  }
+  //console.log("sendPositionGoal");
+}
+
+const useSelectTargetEnd = () => {
+  if (isSettingYaw.value) {
+    // confirm yaw
+    selectGoal.value.yaw = (yawPreview.value);
+    isSettingYaw.value = false;
+    showTargetAngle.value = false;
+    
+    // const pos = worldToCanvas(selectGoal.value.x, selectGoal.value.y);
+    // cursorPosition.value.x = pos.x;
+    // cursorPosition.value.y = pos.y;
+
+    sendPositionGoal(activeTool.value);
+    scheduleRender();
+  }
+  else if (isSettingArea.value) {
+
+    isSettingArea.value = false;
+    scheduleRender();
+  }
+}
+const handleMouseUp = () => {
+  useSelectTargetEnd();
+  isDragging.value = false;
+};
+
+
+const handleTouchStart = (event: TouchEvent) => {
+  event.preventDefault();
+
+  // 1 finger
+  if (event.touches.length === 1) {
+    const touch = event.touches[0];
+
+    // If using point-to-point tool, start goal & yaw selection (no panning)
+    // if (activeTool.value === 'ptp') {
+    //   if (!canvas.value) return;
+    //   const rect = canvas.value.getBoundingClientRect();
+    //   const tx = touch.clientX - rect.left;
+    //   const ty = touch.clientY - rect.top;
+
+    //   // start goal at exact touch point
+    //   const worldPos = canvasToWorld(tx, ty);
+    //   selectGoal.value = { x: worldPos.x, y: worldPos.y, yaw: 0 };
+
+    //   isSettingYaw.value = true;   // start yaw selection mode
+    //   showTargetAngle.value = true;
+    //   yawPreview.value = 0;
+    //   scheduleRender();
+    //   return; // do not start panning while selecting yaw
+    // }
+
+    useSelectTarget(touch);
+
+    // otherwise: start panning (for other tools)
+    touchState.value.lastPos = { x: touch.clientX, y: touch.clientY };
+    isDragging.value = true;
+    return;
+  }
+
+  // 2 fingers: start pinch-zoom
+  if (event.touches.length === 2) {
+    const touch1 = event.touches[0];
+    const touch2 = event.touches[1];
+
+    touchState.value.startDist = Math.hypot(
+      touch1.clientX - touch2.clientX,
+      touch1.clientY - touch2.clientY
+    );
+    touchState.value.startZoom = smoothTransform.getCurrent().scale;
+    touchState.value.startPos = {
+      x: (touch1.clientX + touch2.clientX) / 2,
+      y: (touch1.clientY + touch2.clientY) / 2
+    };
+
+    touchState.value.lastPosMulti = {
+      x: (touch1.clientX + touch2.clientX) / 2,
+      y: (touch1.clientY + touch2.clientY) / 2
+    };
+
+    touchState.value.active = true;
+    isDragging.value = false;
+    return;
+  }
+};
+
+const handleTouchMove = (event: TouchEvent) => {
+  event.preventDefault();
+
+  // While selecting yaw with 1 finger: update preview angle
+  if (isSettingYaw.value && event.touches.length === 1) {
+    if (!canvas.value) return;
+    useSelectTargetMove(event.touches[0]);
+    return; // no panning during yaw selection
+  }
+
+  // Single finger panning (only when not selecting yaw)
+  if (event.touches.length === 1 && isDragging.value) {
+    const touch = event.touches[0];
+    const dx = touch.clientX - touchState.value.lastPos.x;
+    const dy = touch.clientY - touchState.value.lastPos.y;
+
+    const currentTransform = smoothTransform.getCurrent();
+    smoothTransform.setTarget({
+      translateX: currentTransform.translateX + dx,
+      translateY: currentTransform.translateY + dy
+    });
+
+    touchState.value.lastPos = { x: touch.clientX, y: touch.clientY };
+    return;
+  }
+
+  // Two finger: pinch zoom + pan
+  if (event.touches.length === 2 && touchState.value.active) {
+    const touch1 = event.touches[0];
+    const touch2 = event.touches[1];
+
+    const currentDist = Math.hypot(
+      touch1.clientX - touch2.clientX,
+      touch1.clientY - touch2.clientY
+    );
+
+    const zoomFactor = currentDist / touchState.value.startDist;
+    const newScale = Math.max(minZoom, Math.min(maxZoom, touchState.value.startZoom * zoomFactor));
+
+    const centerX = (touch1.clientX + touch2.clientX) / 2;
+    const centerY = (touch1.clientY + touch2.clientY) / 2;
+
+    // pan offset relative to last center
+    touchDiffPos.value.dx = (centerX - touchState.value.lastPosMulti.x);
+    touchDiffPos.value.dy = (centerY - touchState.value.lastPosMulti.y);
+
+    const currentTransform = smoothTransform.getCurrent();
+    smoothTransform.setTarget({
+      scale: newScale,
+      translateX: currentTransform.translateX + touchDiffPos.value.dx,
+      translateY: currentTransform.translateY + touchDiffPos.value.dy
+    });
+
+    touchState.value.lastPosMulti = { x: centerX, y: centerY };
+    return;
+  }
+};
+
+const handleTouchEnd = (event: TouchEvent) => {
+  event.preventDefault();
+
+  // If finishing a yaw selection (no fingers on screen): confirm and send
+  if (isSettingYaw.value && event.touches.length === 0) {
+    useSelectTargetEnd();
+    return;
+  }
+
+  // When all fingers lifted: stop panning/zooming
+  if (event.touches.length === 0) {
+    isDragging.value = false;
+    touchState.value.active = false;
+    return;
+  }
+
+  // If one finger remains after multi-touch: switch to 1-finger pan mode
+  if (event.touches.length === 1) {
+    const touch = event.touches[0];
+    touchState.value.active = false; // end pinch
+    touchState.value.lastPos = { x: touch.clientX, y: touch.clientY };
+    isDragging.value = true;         // start pan
+  }
+};
+
+
+
+
+// Velocity handling
+const handleVelocity = (velocity: { Vx: number, Vy: number }) => {
+  Vx.value = velocity.Vx;
+  Vy.value = velocity.Vy;
+
+  if (ws && isConnected.value) {
+    const velocityCmd = {
+      action: payloadAction.vel_cmd,
+      Vx: Vx.value,
+      Vy: Vy.value,
+    };
+    ws.send(JSON.stringify(velocityCmd));
+  }
+};
+
+// WebSocket connection
+const connectWebSocket = () => {
+  if (ws) ws.close();
+
+  ws = new WebSocket(`ws://${server_websocket_config.ip}:${server_websocket_config.port}`);
+
+  ws.onopen = () => {
+    //console.log('WebSocket connected');
+    isConnected.value = true;
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
+    }
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const { map, odom, map_updated } = JSON.parse(event.data);
+
+      let mapChanged = false;
+      let robotChanged = false;
+
+      // Handle map data
+      if (map?.width && map?.height && map?.data) {
+        const newMapData = {
+          ...map,
+          resolution: map.resolution || 0.05,
+          origin_x: map.origin?.[0] || 0,
+          origin_y: map.origin?.[1] || 0,
+          data: map.compressed ? decompressData(map.data) : map.data,
+          downsampled: map.downsampled || false,
+          originalDimensions: map.original_dimensions || { width: map.width, height: map.height }
+        };
+
+        const newMapHash = `${newMapData.width}-${newMapData.height}-${newMapData.data.length}`;
+        if (renderState.lastMapHash !== newMapHash || map_updated) {
+          mapData.value = newMapData;
+          renderState.mapTexture = generateMapTexture(newMapData);
+          renderState.lastMapHash = newMapHash;
+          //console.log("map update !")
+          mapChanged = true;
+
+          // Update map center for resolution tracking
+          mapCenterWorld.value = {
+            x: newMapData.origin_x + (newMapData.width * newMapData.resolution) / 2,
+            y: newMapData.origin_y + (newMapData.height * newMapData.resolution) / 2
+          };
+        }
+      }
+
+      // Handle robot position
+      if (odom?.position && odom?.orientation) {
+        const newRobotPosition = {
+          x: odom.position.x,
+          y: odom.position.y,
+          yaw: -(quaternionToEuler(odom.orientation.x, odom.orientation.y, odom.orientation.z, odom.orientation.w).yaw - 1.5708)
+        };
+
+        const newRobotHash = `${newRobotPosition.x.toFixed(3)}-${newRobotPosition.y.toFixed(3)}-${newRobotPosition.yaw.toFixed(3)}`;
+        if (renderState.lastRobotState.hash !== newRobotHash) {
+          robotPosition.value = newRobotPosition;
+          renderState.lastRobotState = { ...newRobotPosition, hash: newRobotHash };
+          robotChanged = true;
+        }
+      }
+
+      // Schedule render if needed
+      if (mapChanged || robotChanged) {
+        scheduleRender();
+      }
+
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+    }
+  };
+
+  ws.onerror = (error) => {
+    console.error('WebSocket error:', error);
+    isConnected.value = false;
+  };
+
+  ws.onclose = () => {
+    //console.log('WebSocket disconnected');
+    isConnected.value = false;
+    showStatusState.value = false;
+    reconnectTimeout = setTimeout(connectWebSocket, 1000);
+  };
+};
+
+// Utility functions
+const decompressData = (compressedData: [number, number][]) => {
+  const result: number[] = [];
+  for (const [value, count] of compressedData) {
+    for (let i = 0; i < count; i++) {
+      result.push(value);
+    }
+  }
+  return result;
+};
+
+const quaternionToEuler = (x: number, y: number, z: number, w: number) => {
+  const sinr_cosp = 2 * (w * x + y * z);
+  const cosr_cosp = 1 - 2 * (x * x + y * y);
+  const roll = Math.atan2(sinr_cosp, cosr_cosp);
+
+  const sinp = 2 * (w * y - z * x);
+  const pitch = Math.asin(Math.max(-1, Math.min(1, sinp)));
+
+  const siny_cosp = 2 * (w * z + x * y);
+  const cosy_cosp = 1 - 2 * (y * y + z * z);
+  const yaw = Math.atan2(siny_cosp, cosy_cosp);
+
+  return { roll, pitch, yaw };
+};
+
+// FIXED: Better debounced resize with orientation change detection
+let resizeTimeout: number | null = null;
+let orientationTimeout: number | null = null;
+const debouncedResize = () => {
+  if (resizeTimeout) clearTimeout(resizeTimeout);
+  resizeTimeout = setTimeout(() => {
+    handleResize();
+  }, 100);
+};
+
+// Handle orientation changes separately with longer delay
+const handleOrientationChange = () => {
+  if (orientationTimeout) clearTimeout(orientationTimeout);
+  orientationTimeout = setTimeout(() => {
+    //console.log('Orientation changed, adjusting layout');
+    handleResize();
+  }, 300); // Longer delay for orientation changes
+};
+
+// FIXED: Enhanced lifecycle with better event handling
+onMounted(async () => {
+  await nextTick();
+
+  // Clear all multiple point
+  clearMultiPoint();
+
+  // Mobile optimizations
+  const isMobile = optimizeForMobile();
+
+  // Initialize canvas with proper sizing
+  handleResize();
+
+  // Prevent double-zoom on mobile
+  if (canvas.value && isMobile) {
+    preventDoubleZoom(canvas.value);
+  }
+
+  // Set up event listeners with proper cleanup tracking
+  window.addEventListener('resize', debouncedResize);
+
+  // Mobile-specific event listeners
+  if (isMobile) {
+    // Handle orientation changes with separate handler
+    window.addEventListener('orientationchange', handleOrientationChange);
+
+    // Handle viewport height changes (mobile browser toolbars)
+    const handleViewportChange = () => {
+      const vh = window.innerHeight * 0.01;
+      document.documentElement.style.setProperty('--vh', `${vh}px`);
+      debouncedResize();
+    };
+
+    // Use separate handlers for different events
+    window.addEventListener('resize', handleViewportChange);
+
+    // Prevent pull-to-refresh on mobile
+    document.body.style.overscrollBehavior = 'none';
+  }
+
+  watch(multiGoal, () => {
+    multiGoalUpdate.value = true;
+    //console.log("watcher")
+  }, { deep: true })
+
+  // Connect WebSocket
+  connectWebSocket();
+
+  // Auto-fit when map loads with retry mechanism
+  const mapWatcher = () => {
+    if (mapData.value && canvasWidth.value > 0 && canvasHeight.value > 0) {
+      // Delay auto-fit to ensure everything is properly initialized
+      setTimeout(() => {
+        autoFitMap();
+      }, 100);
+    } else {
+      requestAnimationFrame(mapWatcher);
+    }
+  };
+  mapWatcher();
+});
+
+onBeforeUnmount(() => {
+  // Enhanced cleanup
+  if (ws) ws.close();
+  if (reconnectTimeout) clearTimeout(reconnectTimeout);
+  if (resizeTimeout) clearTimeout(resizeTimeout);
+  if (orientationTimeout) clearTimeout(orientationTimeout);
+  if (renderState.animationFrameId) cancelAnimationFrame(renderState.animationFrameId);
+
+  // Remove all event listeners
+  window.removeEventListener('resize', debouncedResize);
+
+  // Mobile cleanup
+  if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
+    window.removeEventListener('orientationchange', handleOrientationChange);
+    document.body.style.position = '';
+    document.body.style.overscrollBehavior = '';
+
+    // Reset viewport height
+    document.documentElement.style.removeProperty('--vh');
+  }
+});
+
+
+</script>

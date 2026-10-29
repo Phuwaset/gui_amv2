@@ -1,0 +1,435 @@
+<template>
+  <div class="main-container">
+    <div class="map-container">
+      <!-- Show status message when NOT showing toolbox -->
+      <div v-if="!showStatusState" class="status"
+        :class="{ connected: socketService.isConnected.value, disconnected: !socketService.isConnected.value }">
+        {{ socketService.isConnected.value ? 'Connected' : 'Disconnected (Try again ?)' }}
+      </div>
+
+      <!-- Show toolbox when connected and after initial delay -->
+      <div v-if="showStatusState && socketService.isConnected.value">
+        <ToolboxComponent v-model="activeTool" :enableHotkeys="true" :show="true" orientation="horizontal" />
+      </div>
+
+      <div>
+
+      </div>
+
+      <div class="canvas-container" ref="canvasContainer" @wheel="eventHandlers.handleWheel"
+        @touchstart="eventHandlers.handleTouchStart" @touchmove="eventHandlers.handleTouchMove"
+        @touchend="eventHandlers.handleTouchEnd" @mousedown="eventHandlers.handleMouseDown"
+        @mousemove="eventHandlers.handleMouseMove" @mouseup="eventHandlers.handleMouseUp"
+        @mouseleave="eventHandlers.handleMouseUp">
+
+        <canvas ref="canvas" :width="canvasWidth" :height="canvasHeight" class="main-canvas"
+          :style="{ cursor: (activeTool === 'ptp' || activeTool === 'mptp') ? 'crosshair' : (activeTool === 'cursor' ? 'pointer' : 'default') }">
+        </canvas>
+
+        <div class="layer-controls" v-if="showDebugControls">
+          <label>
+            <input type="checkbox" v-model="layerVisibility.map" @change="mapEngine.forceRedraw()"> Map
+          </label>
+          <label>
+            <input type="checkbox" v-model="layerVisibility.robot" @change="mapEngine.forceRedraw()"> Robot
+          </label>
+          <label>
+            <input type="checkbox" v-model="layerVisibility.target" @change="mapEngine.forceRedraw()"> Target
+          </label>
+        </div>
+      </div>
+
+
+      <ToolInspection :state="state" :mapEngine="mapEngine" :zoomLevel="zoomLevel" :minZoom="minZoom" :maxZoom="maxZoom"
+        :showPerformanceInfo="showPerformanceInfo" :currentFPS="currentFPS" @exportJson="handleExportJson" @exportToMap="handleExportMap" @ExecuteGoal="handleExecuteGoal" @ExecuteCancelGoal="handleExecuteCancelGoal" />
+    </div>
+
+    <div class="joystick-container" :style="{ bottom: joystickBottomPosition + 'px' }">
+      <JoystickComponent @updateVelocity="handleVelocity" />
+    </div>
+
+    <!-- <div class="zoom-container">
+      <div class="zoom-controls">
+        <button @click="mapEngine.zoomIn()" :disabled="zoomLevel >= maxZoom">+</button>
+        <button @click="mapEngine.zoomOut()" :disabled="zoomLevel <= minZoom">-</button>
+      </div>
+      <div class="zoom-size">
+        Size: {{ zoomLevel.toFixed(1) }}
+      </div>
+      <div class="performance-info" v-if="showPerformanceInfo">
+        <div>FPS: {{ currentFPS }}</div>
+      </div>
+    </div> -->
+  </div>
+</template>
+
+<script setup lang="ts">
+import JoystickComponent from 'components/assets/joystick/JoystickAsset.vue';
+import ToolboxComponent from '../map/toolbox/ToolBox.vue';
+
+import './css/MapAsset.css';
+import { onMounted, onBeforeUnmount, computed, nextTick, watch, ref } from 'vue';
+
+// Modular imports
+import type { ExportedMap } from './state/mapState';
+import { createMapState } from './state/mapState';
+
+import { MapEngine } from './engine/MapEngine';
+import { EventHandlers } from './engine/eventHandlers';
+import { ResizeManager } from './engine/resizeManager';
+import { optimizeForMobile, preventDoubleZoom, cleanupMobile } from './engine/mobileUtils';
+import { socketService } from 'src/services/socketService';
+import { decompressData } from './engine/texture';
+import ToolInspection from './toolbox/ToolInspection.vue';
+
+
+
+// Create state
+const state = createMapState();
+
+// Destructure reactive refs for template access
+const {
+  canvas,
+  canvasContainer,
+  canvasWidth,
+  canvasHeight,
+  activeTool,
+  showConnected,
+  showStatusState,
+  zoomLevel,
+  minZoom,
+  maxZoom,
+  Vx,
+  Vy,
+  showDebugControls,
+  showPerformanceInfo,
+  currentFPS,
+  layerVisibility,
+  multiGoal,
+} = state;
+
+const jsonData :ExportedMap = {
+  map_section: [
+    {
+      section_lable: "MAP",
+      section_color: "#22c55e",
+      section_position: [
+        { x: -0.33, y: -1.48, idx: 0 },
+        { x: 1.72, y: -1.48, idx: 1 },
+        { x: 1.72, y: 0.34, idx: 2 },
+        { x: -0.33, y: 0.34, idx: 3 }
+      ],
+      section_position_centroid: { x: 0.7, y: -0.57 },
+      section_marker: [
+        { marker_name: "B", marker_type: "point", marker_position: { x: 1.25, y: -1.25, yaw: 0 } },
+        { marker_name: "C", marker_type: "point", marker_position: { x: 0, y: -1.25, yaw: -0.02 } },
+        { marker_name: "A", marker_type: "point", marker_position: { x: 1.25, y: 0, yaw: 0 } },
+        { marker_name: "D", marker_type: "point", marker_position: { x: 0, y: 0, yaw: 0 } }
+      ]
+    }
+  ],
+  map_size: { width: 0, height: 0 }
+}
+
+console.log(jsonData)
+
+// Computed properties
+const joystickBottomPosition = computed(() => 20);
+
+// Initialize engine
+const mapEngine = new MapEngine(state);
+
+// Initialize event handlers - now using global socketService
+const eventHandlers = new EventHandlers(state, mapEngine, socketService);
+
+// Initialize resize manager
+const resizeManager = new ResizeManager(state, mapEngine);
+
+// Subscribe to WebSocket messages
+let unsubscribeMessages: (() => void) | null = null;
+let unsubscribeConnection: (() => void) | null = null;
+
+
+
+// mapEngine.import_from_json(jsonData , state )
+
+// Watchers
+watch(() => socketService.isConnected.value, (val) => {
+  state.isConnected.value = val;
+  //console.log("connector : connected")
+  if (val) {
+
+    // When connected, briefly show "Connected" message
+    showConnected.value = true;
+    showStatusState.value = false;
+    setTimeout(() => {
+      // After 2 seconds, hide the status message and show the toolbox
+      showConnected.value = false;
+      if (socketService.isConnected.value) {
+        showStatusState.value = true;
+      }
+    }, 2000);
+  } else {
+    // When disconnected, hide toolbox and the status div will show "Disconnected"
+    showStatusState.value = false;
+  }
+});
+
+watch(multiGoal, () => {
+  state.multiGoalUpdate.value = true;
+  //console.log('multiGoal watcher');
+}, { deep: true });
+
+// Velocity handler
+const handleVelocity = (velocity: { Vx: number; Vy: number , heartbeat : boolean}) => {
+  Vx.value = velocity.Vx;
+  Vy.value = velocity.Vy;
+
+  socketService.sendVelocityCommand(Vx.value, Vy.value , velocity.heartbeat);
+};
+
+const handleExportJson = (onclick : boolean) => {
+  mapEngine.export_to_json(state.multiGoal.value,state.areaRects.value);
+  console.log(onclick);
+}
+
+
+const handleExecuteCancelGoal = () => {
+  console.log("handleCancelGoal");
+  socketService.sendCancelMultiGoal();
+
+}
+const handleExecuteGoal = () => {
+  console.log("handleGoal");
+  socketService.sendExecMultiGoal();
+}
+const handleExportMap =  () => {
+  // await eventHandlers.saveEditedMap(mapEngine,'test.pgm',1)
+  mapEngine.exportAsPGM('map.pgm');
+  console.log("save edit mapper")
+}
+
+// Clear multi-point goals
+const clearMultiPoint = () => {
+  multiGoal.value = [];
+};
+
+// Utility: quaternion to euler
+const quaternionToEuler = (x: number, y: number, z: number, w: number) => {
+  const sinr_cosp = 2 * (w * x + y * z);
+  const cosr_cosp = 1 - 2 * (x * x + y * y);
+  const roll = Math.atan2(sinr_cosp, cosr_cosp);
+
+  const sinp = 2 * (w * y - z * x);
+  const pitch = Math.asin(Math.max(-1, Math.min(1, sinp)));
+
+  const siny_cosp = 2 * (w * z + x * y);
+  const cosy_cosp = 1 - 2 * (y * y + z * z);
+  const yaw = Math.atan2(siny_cosp, cosy_cosp);
+
+  return { roll, pitch, yaw };
+};
+
+// Handle incoming WebSocket messages
+const handleWebSocketMessage = (message: {
+  map?: {
+    width: number;
+    height: number;
+    data: number[] | [number, number][];
+    resolution?: number;
+    origin?: [number, number];
+    compressed?: boolean;
+    downsampled?: boolean;
+    original_dimensions?: { width: number; height: number };
+  };
+  odom?: {
+    position: { x: number; y: number; z: number };
+    orientation: { x: number; y: number; z: number; w: number };
+  };
+  map_updated?: boolean;
+}) => {
+  const { map, odom, map_updated } = message;
+
+  let mapChanged = false;
+  let robotChanged = false;
+
+  // Handle map data
+  if (map?.width && map?.height && map?.data) {
+    const newMapData = {
+      ...map,
+      resolution: map.resolution || 0.05,
+      origin_x: map.origin?.[0] || 0,
+      origin_y: map.origin?.[1] || 0,
+      data: map.compressed ? decompressData(map.data) : map.data,
+      downsampled: map.downsampled || false,
+      originalDimensions: map.original_dimensions || { width: map.width, height: map.height },
+    };
+
+    const newMapHash = `${newMapData.width}-${newMapData.height}-${newMapData.data.length}`;
+    if (state.renderState.lastMapHash !== newMapHash || map_updated) {
+      state.mapData.value = newMapData;
+     void mapEngine.updateMapTexture(newMapData);
+
+      //console.log('map update!');
+      mapChanged = true;
+    }
+  }
+
+  // Handle robot position
+  if (odom?.position && odom?.orientation) {
+    const newRobotPosition = {
+      x: odom.position.x,
+      y: odom.position.y,
+      yaw: -(
+        quaternionToEuler(
+          odom.orientation.x,
+          odom.orientation.y,
+          odom.orientation.z,
+          odom.orientation.w
+        ).yaw - 1.5708
+      ),
+    };
+
+    const newRobotHash = `${newRobotPosition.x.toFixed(3)}-${newRobotPosition.y.toFixed(3)}-${newRobotPosition.yaw.toFixed(3)}`;
+    if (state.renderState.lastRobotState.hash !== newRobotHash) {
+      state.robotPosition.value = newRobotPosition;
+      state.renderState.lastRobotState = { ...newRobotPosition, hash: newRobotHash };
+      robotChanged = true;
+    }
+  }
+
+  // Schedule render if needed
+  if (mapChanged || robotChanged) {
+    mapEngine.forceRedraw();
+  }
+};
+
+
+const didFitMap = ref(false);
+
+// 1) Wait until map + canvas ready, then call autoFitMap ONCE
+function waitForMapReady() {
+  if (state.mapData.value && canvasWidth.value > 0 && canvasHeight.value > 0) {
+    if (!didFitMap.value) {
+      setTimeout(() => {
+        mapEngine.autoFitMap();
+        didFitMap.value = true;
+      }, 100);
+    }
+  } else {
+    requestAnimationFrame(waitForMapReady);
+  }
+}
+
+// 2) Update areaRects when multiGoal changes (rAF batched)
+let rafId = 0;
+let dirty = false;
+
+function scheduleRectsUpdate() {
+  if (dirty) return;
+  dirty = true;
+  rafId = requestAnimationFrame(() => {
+    dirty = false;
+    const updated = mapEngine.assignMarkersToRects(
+      state.multiGoal.value,   // markers
+      state.areaRects.value    // rects
+    );  
+
+    state.areaRects.value = updated;
+  });
+}
+
+
+// Lifecycle hooks
+onMounted(async () => {
+  await nextTick();
+
+  // Clear all multiple points
+  clearMultiPoint();
+
+  // Mobile optimizations
+  const isMobile = optimizeForMobile();
+
+  // Initialize canvas
+  resizeManager.handleResize();
+
+  // Prevent double-zoom on mobile
+  if (canvas.value && isMobile) {
+    preventDoubleZoom(canvas.value);
+  }
+
+  // Set up event listeners
+  window.addEventListener('resize', resizeManager.debouncedResize);
+
+  // Mobile-specific event listeners
+  if (isMobile) {
+    window.addEventListener('orientationchange', resizeManager.handleOrientationChange);
+
+    const handleViewportChange = () => {
+      const vh = window.innerHeight * 0.01;
+      document.documentElement.style.setProperty('--vh', `${vh}px`);
+      resizeManager.debouncedResize();
+    };
+
+    window.addEventListener('resize', handleViewportChange);
+  }
+
+  // Subscribe to WebSocket messages
+  unsubscribeMessages = socketService.onMessage(handleWebSocketMessage);
+
+  // Subscribe to connection status
+  unsubscribeConnection = socketService.onConnectionChange((connected) => {
+    state.isConnected.value = connected;
+    //console.log(`[MapAsset] Connection status: ${connected}`);
+  });
+
+
+  // mapWatcher();
+  waitForMapReady();
+  scheduleRectsUpdate();
+
+  watch(() => (state.multiGoal.value , state.areaRects.value), scheduleRectsUpdate, { deep: true });
+
+  watch(()=> (state.multiGoal.value) , ()=> {
+    console.log("update")
+    eventHandlers.sendPositionGoal('cursor',true);
+  })
+
+  // When connected, briefly show "Connected" message
+  showConnected.value = true;
+  showStatusState.value = false;
+  setTimeout(() => {
+    // After 2 seconds, hide the status message and show the toolbox
+    showConnected.value = false;
+    if (socketService.isConnected.value) {
+      showStatusState.value = true;
+    }
+  }, 2000);
+
+});
+
+onBeforeUnmount(() => {
+  if (rafId) cancelAnimationFrame(rafId);
+
+  // Unsubscribe from WebSocket
+  if (unsubscribeMessages) unsubscribeMessages();
+  if (unsubscribeConnection) unsubscribeConnection();
+
+  // Cleanup
+  resizeManager.cleanup();
+
+  if (state.renderState.animationFrameId) {
+    cancelAnimationFrame(state.renderState.animationFrameId);
+  }
+
+  // Remove event listeners
+  window.removeEventListener('resize', resizeManager.debouncedResize);
+
+  // Mobile cleanup
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+  if (isMobile) {
+    window.removeEventListener('orientationchange', resizeManager.handleOrientationChange);
+    cleanupMobile();
+  }
+});
+</script>

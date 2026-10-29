@@ -1,0 +1,710 @@
+<template class="main-container">
+  <div class="map-container">
+    <div class="status" :class="{ connected: isConnected, disconnected: !isConnected }">
+      {{ isConnected ? 'Connected' : 'Disconnected' }}
+    </div>
+    <div class="canvas-container" @wheel="handleWheel" @touchstart="handleTouchStart" @touchmove="handleTouchMove"
+      @touchend="handleTouchEnd" @mousedown="handleMouseDown" @mousemove="handleMouseMove" @mouseup="handleMouseUp"
+      @mouseleave="handleMouseUp">
+      <canvas ref="canvas" :width="canvasWidth" :height="canvasHeight" @click="handleGoalClick"></canvas>
+      <!-- Overlay canvas for goal marking -->
+
+    </div>
+    <!-- <div class="map-controls">
+      <button @click="reconnectWebSocket" :disabled="isConnected">Reconnect</button>
+    </div> -->
+
+  </div>
+  <!-- Joystick Container -->
+  <div class="joystick-container" :style="{ bottom: joystickBottomPosition + 'px' }">
+    <JoystickComponent @updateVelocity="handleVelocity" />
+    <p>Velocity X: {{ Vx.toFixed(2) }}</p>
+    <p>Velocity Y: {{ Vy.toFixed(2) }}</p>
+  </div>
+  <div class="zoom-container">
+    <div class="zoom-controls">
+      <button @click="zoomIn">+</button>
+      <button @click="zoomOut">-</button>
+    </div>
+    <div class="zoom-size">
+      Size: {{ zoomLevel.toFixed(1) }}
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+// import { biWindowSidebar } from '@quasar/extras/bootstrap-icons';
+import JoystickComponent from 'components/JoystickComponent.vue';
+
+import { ref, onMounted, onBeforeUnmount, computed } from 'vue';
+
+
+interface OccupancyGrid {
+  width: number;
+  height: number;
+  resolution: number;
+  origin_x: number;
+  origin_y: number;
+  data: number[];
+  downsampled: boolean;
+  originalDimensions: { width: number; height: number };
+}
+
+const canvas = ref<HTMLCanvasElement | null>(null);
+const mapData = ref<OccupancyGrid | null>(null);
+const robotPosition = ref<{ x: number; y: number, yaw: number }>({ x: 0, y: 0 });
+const isConnected = ref(false);
+const zoomLevel = ref(1.0);
+const canvasWidth = ref(1080);
+const canvasHeight = ref(1080);
+const offsetX = ref(0); // Pan offset
+const offsetY = ref(0); // Pan offset
+const isDragging = ref(false); // Track dragging state
+const startDrag = ref({ x: 0, y: 0 }); // Starting point for drag
+// const goals = ref<{ x: number; y: number }[]>([]);
+const singleGoal = ref<{ x: number; y: number, yaw: number }>({ x: 0, y: 0 , yaw : 0 });
+
+let ws: WebSocket | null = null;
+let reconnectTimeout: number | null = null;
+
+const touchStart = ref<{ x: number; y: number }>({ x: 0, y: 0 });
+let touchStartDist = 0;
+let touchStartZoom = 1.0;
+
+let resizeTimeout: number | null = null;
+
+const Vx = ref(0);
+const Vy = ref(0);
+ 
+
+const handleGoalClick = (event: MouseEvent) => {
+  // Ensure we have all the necessary data to perform the calculation
+  if (!canvas.value || !mapData.value || !robotPosition.value) {
+    console.warn('Cannot handle goal click: missing canvas, map data, or robot position.');
+    return;
+  }
+
+  // Destructure for easier access. No 'data' is needed here, fixing the unused var warning.
+  const { resolution, origin_x, origin_y, width: mapWidth, height: mapHeight } = mapData.value;
+  const { x: robotX_world, y: robotY_world, yaw: robotYaw_world } = robotPosition.value;
+  const rect = canvas.value.getBoundingClientRect();
+
+  // Step 1: Convert screen click to map pixel coordinates.
+  // This reverses the pan (translate) and zoom (scale) transformations from the drawMap function.
+  const clickX_on_canvas = event.clientX - rect.left;
+  const clickY_on_canvas = event.clientY - rect.top;
+
+  const mapPixelX = (clickX_on_canvas - offsetX.value) / zoomLevel.value;
+  const mapPixelY = (clickY_on_canvas - offsetY.value) / zoomLevel.value;
+
+  // Check if the click was within the map's pixel bounds
+  if (mapPixelX < 0 || mapPixelX > mapWidth || mapPixelY < 0 || mapPixelY > mapHeight) {
+    console.warn('Clicked position is outside the map bounds.');
+    // return;
+  }
+
+  // Step 2: Convert Map Pixel Coordinates to World Coordinates (in meters)
+  const clickedX_world = origin_x + mapPixelX * resolution;
+  // The map's Y-axis is flipped. (0,0) is top-left for the map data.
+  // The map's origin_y is the y-coordinate of the bottom-left corner of the map in the world frame.
+  const clickedY_world = origin_y + (mapHeight - mapPixelY) * resolution;
+
+  // Step 3: Convert World Coordinates to the Robot's Local Frame Coordinates
+  const translatedX = clickedX_world - robotX_world;
+  const translatedY = clickedY_world - robotY_world;
+
+  // Rotate by -yaw to align with the robot's frame
+  const cosYaw = Math.cos(robotYaw_world);
+  const sinYaw = Math.sin(robotYaw_world);
+  const goalX_robotFrame = translatedX * cosYaw + translatedY * sinYaw;
+  const goalY_robotFrame = -translatedX * sinYaw + translatedY * cosYaw;
+
+  // Store the new goal in world coordinates so it can be drawn correctly on the map.
+  // goals.value.push({ x: clickedX_world, y: clickedY_world });
+  singleGoal.value = { x: clickedX_world, y: clickedY_world , yaw : 0};
+
+  const singleGoalPackage ={
+     "action" : "goal_cmd", 
+      x : singleGoal.value.x,
+      y : singleGoal.value.y,
+      yaw : singleGoal.value.yaw
+  };
+
+  ws.send(JSON.stringify(singleGoalPackage))
+
+
+  // console.log(goals.value)
+  // drawMap(true);
+  // drawGoalMarkers();
+
+  console.log(`Goal marked in world coordinates at: (${clickedX_world.toFixed(2)}, ${clickedY_world.toFixed(2)})`);
+  console.log(`Goal marked relative to robot at: (${goalX_robotFrame.toFixed(2)}, ${goalY_robotFrame.toFixed(2)})`);
+};
+
+
+
+// const drawGoalMarkers = () => {
+//   if (canvas.value) {
+//     const ctx = canvas.value.getContext('2d');
+//     if (ctx) {
+//       ctx.clearRect(0, 0, canvas.value.width, canvas.value.height);
+
+//       // Draw the marked goals on the overlay canvas
+//       goals.value.forEach(goal => {
+//         const { x, y } = goal;
+//         // const screenX = (x * zoomLevel.value) + offsetX.value;
+//         // const screenY = (y * zoomLevel.value) + offsetY.value;
+
+//         console.log('scx:%f,scy:%f', x, y);
+//         ctx.fillStyle = 'red';
+//         ctx.beginPath();
+//         ctx.arc(95, 50, 40, 0, 2 * Math.PI);
+//         ctx.fill();
+//       });
+//     }
+//   }
+// };
+
+const handleVelocity = (velocity: { Vx: number, Vy: number }) => {
+  Vx.value = velocity.Vx;
+  Vy.value = velocity.Vy;
+
+  if (ws && isConnected.value == true) {
+    // eslint-disable-next-line prefer-const
+    let velocity = {
+      "action" : "vel_cmd", 
+      "Vx": Vx.value,
+      "Vy": Vy.value,
+    }
+
+    console.log(velocity);
+
+    ws.send(JSON.stringify(velocity))
+
+
+  }
+
+
+
+};
+
+const connectWebSocket = () => {
+  if (ws) {
+    ws.close();
+  }
+
+  ws = new WebSocket('ws://192.168.10.2:7448');
+
+  ws.onopen = () => {
+    console.log('WebSocket connection established');
+    isConnected.value = true;
+    if (reconnectTimeout !== null) {
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
+    }
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const { map, odom } = JSON.parse(event.data);
+      if (map.width && map.height && map.data) {
+        mapData.value = {
+          ...map,
+          resolution: map.resolution,
+          origin_x: map.origin ? map.origin[0] : 0,
+          origin_y: map.origin ? map.origin[1] : 0,
+          data: map.compressed ? decompressData(map.data) : map.data,
+          downsampled: map.downsampled,
+          originalDimensions: map.original_dimensions
+        };
+        adjustCanvasSize();
+        drawMap();
+      }
+      robotPosition.value = {
+        x: odom.position.x,
+        y: odom.position.y,
+        yaw: -(quaternionToEuler(odom.orientation.x, odom.orientation.y, odom.orientation.z, odom.orientation.w).yaw - 1.5708)
+      };
+    } catch (error) {
+      console.error('WebSocket error:', error);
+    }
+  };
+
+  ws.onerror = (error) => {
+    console.error('WebSocket error:', error);
+    isConnected.value = false;
+  };
+
+  ws.onclose = () => {
+    console.log('WebSocket connection closed');
+    isConnected.value = false;
+
+    reconnectTimeout = window.setTimeout(() => {
+      console.log('Attempting to reconnect...');
+      connectWebSocket();
+    }, 5000);
+  };
+}
+
+// Reference to the menu bar
+const menuBar = ref<HTMLElement | null>(null);
+
+// The dynamic bottom position of the joystick based on menu height
+const joystickBottomPosition = computed(() => {
+  if (menuBar.value) {
+    const menuBarHeight = menuBar.value.offsetHeight;
+    return Math.max(10, 10 + menuBarHeight);  // Adding distance to the bottom based on menu height
+  }
+  return 10;  // Default value if no menu bar is found
+});
+
+const decompressData = (compressedData: [number, number][]) => {
+  const result: number[] = [];
+
+  for (const [value, count] of compressedData) {
+    for (let i = 0; i < count; i++) {
+      result.push(value);
+    }
+  }
+
+  return result;
+};
+
+const adjustCanvasSize = () => {
+  if (!mapData.value) return;
+
+  const aspectRatio = mapData.value.width / mapData.value.height;
+  const viewportWidth = window.innerWidth * 9.9; //0.9
+  const viewportHeight = window.innerHeight * 9.7;
+
+  if (aspectRatio > 1) {
+    canvasWidth.value = Math.min(viewportWidth, mapData.value.width * zoomLevel.value);
+    canvasHeight.value = canvasWidth.value / aspectRatio;
+  } else {
+    canvasHeight.value = Math.min(viewportHeight, mapData.value.height * zoomLevel.value);
+    canvasWidth.value = canvasHeight.value * aspectRatio;
+  }
+};
+
+const zoomIn = () => {
+  zoomLevel.value += 0.1;
+  adjustCanvasSize();
+  drawMap();
+};
+
+const zoomOut = () => {
+  zoomLevel.value -= 0.1;
+  zoomLevel.value = Math.max(0.1, zoomLevel.value); // Ensure zoom doesn't go below 0.1
+  adjustCanvasSize();
+  drawMap();
+};
+
+const handleWheel = (event: WheelEvent) => {
+  if (event.deltaY < 0) {
+    zoomIn();
+  } else {
+    zoomOut();
+  }
+  event.preventDefault();
+};
+
+
+const handleTouchStart = (event: TouchEvent) => {
+  if (event.touches.length === 2) {
+    const touch1 = event.touches[0];
+    const touch2 = event.touches[1];
+
+    // Calculate the initial distance between the two touches for zooming
+    touchStartDist = Math.hypot(
+      touch1.clientX - touch2.clientX,
+      touch1.clientY - touch2.clientY
+    );
+    touchStartZoom = zoomLevel.value;
+
+    // Store the initial touch positions for panning
+    touchStart.value.x = touch1.clientX;
+    touchStart.value.y = touch1.clientY;
+  }
+  updateServerValue();
+};
+
+const handleTouchMove = (event: TouchEvent) => {
+  if (event.touches.length === 2) {
+    const touch1 = event.touches[0];
+    const touch2 = event.touches[1];
+
+    // Calculate the distance between the two touches for zooming
+    const touchDist = Math.hypot(
+      touch1.clientX - touch2.clientX,
+      touch1.clientY - touch2.clientY
+    );
+
+    // Zoom factor based on distance change
+    const zoomFactor = touchDist / touchStartDist;
+    zoomLevel.value = touchStartZoom * zoomFactor;
+    zoomLevel.value = Math.max(0.1, Math.min(zoomLevel.value, 5.0)); // Limit zoom level
+
+    // Calculate the pan movement along the X-axis
+    const xMovement = touch1.clientX - touchStart.value.x;
+    const yMovement = touch1.clientY - touchStart.value.y;
+
+    // Apply pan movement to the X-axis
+    offsetX.value += xMovement * 1.50;  // Adjust the pan speed by changing this multiplier
+    offsetY.value += yMovement * 1.50;  // You can also add Y-axis movement if needed
+
+    // Update the starting point for the next move
+    touchStart.value.x = touch1.clientX;
+    touchStart.value.y = touch1.clientY;
+
+    adjustCanvasSize();
+    drawMap(true);
+  }
+
+  updateServerValue();
+};
+
+
+const handleTouchEnd = () => {
+  touchStartDist = 0;
+  touchStartZoom = 1.0;
+  updateServerValue();
+  drawMap(true);
+};
+
+const handleMouseDown = (event: MouseEvent) => {
+  isDragging.value = true;
+  startDrag.value = { x: event.clientX, y: event.clientY };
+};
+
+const handleMouseMove = (event: MouseEvent) => {
+  if (isDragging.value) {
+    const dx = event.clientX - startDrag.value.x;
+    const dy = event.clientY - startDrag.value.y;
+    offsetX.value += dx;
+    offsetY.value += dy;
+    startDrag.value = { x: event.clientX, y: event.clientY };
+    drawMap(true);
+  }
+};
+
+const handleMouseUp = () => {
+  isDragging.value = false;
+  drawMap(true);
+};
+
+function quaternionToEuler(x: number, y: number, z: number, w: number) {
+  const sinr_cosp = 2 * (w * x + y * z);
+  const cosr_cosp = 1 - 2 * (x * x + y * y);
+  const roll = Math.atan2(sinr_cosp, cosr_cosp);
+
+  const sinp = 2 * (w * y - z * x);
+  const pitch = Math.asin(Math.max(-1, Math.min(1, sinp)));
+
+  const siny_cosp = 2 * (w * z + x * y);
+  const cosy_cosp = 1 - 2 * (y * y + z * z);
+  const yaw = Math.atan2(siny_cosp, cosy_cosp);
+
+  return { roll, pitch, yaw };
+}
+
+let isDrawing = false;
+let lastDrawTime = 0;
+const DRAW_INTERVAL = 1000 / 60;  // 60 FPS limit (adjust as necessary)
+let mapImageData = null;  // Cache the map image data
+let prevMapData = null;  // Cache the previous map data to check for updates
+let prevRobotPosition = null;  // Cache the previous robot position to reduce unnecessary redraws
+
+
+const drawMarker = (ctx: CanvasRenderingContext2D, x: number, y: number, color = "#d00") => {
+  const { width, height, resolution, origin_x, origin_y } = mapData.value;
+  const { width: canvasWidth, height: canvasHeight } = canvas.value;
+
+  const robotX = ((x - origin_x) / resolution) * (canvasWidth / width) + offsetX.value;
+  const robotY = ((origin_y + height * resolution - y) / resolution) * (canvasHeight / height) + offsetY.value;
+
+  ctx.save();
+
+  // Marker base (pin head)
+  ctx.beginPath();
+  ctx.arc(robotX, robotY - 10, 10, 0, Math.PI * 2, true);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.closePath();
+
+  // Marker tip (triangle tail)
+  ctx.beginPath();
+  ctx.moveTo(robotX, robotY);        // tip
+  ctx.lineTo(robotX - 7, robotY - 10); // left side
+  ctx.lineTo(robotX + 7, robotY - 10); // right side
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  // White circle center
+  ctx.beginPath();
+  ctx.arc(robotX, robotY - 10, 4, 0, Math.PI * 2, true);
+  ctx.fillStyle = "#fff";
+  ctx.fill();
+  ctx.closePath();
+
+  ctx.restore();
+}
+
+const drawMap = (force: boolean = false) => {
+  if (isDrawing || !canvas.value || !mapData.value) return;
+  const currentTime = performance.now();
+
+  // Skip drawing if it's too soon (e.g., for limiting FPS to 60)
+  if (currentTime - lastDrawTime < DRAW_INTERVAL) return;
+  lastDrawTime = currentTime;
+
+  // If map data has changed or we force a redraw, regenerate the image
+  if (mapData.value !== prevMapData || force) {
+    prevMapData = { ...mapData.value };  // Save the current map data as the previous one
+    mapImageData = null;  // Invalidate the cached map image
+  }
+
+  // If robot position changed, update the robot's position on the map
+  const shouldDrawRobot = robotPosition.value !== prevRobotPosition;
+  if (shouldDrawRobot || force) {
+    prevRobotPosition = { ...robotPosition.value };
+  }
+
+  isDrawing = true;
+
+  requestAnimationFrame(() => {
+    const ctx = canvas.value.getContext('2d');
+    if (!ctx) return;
+
+    ctx.imageSmoothingEnabled = false;
+    const { width, height, data, resolution, origin_x, origin_y } = mapData.value;
+    const { width: canvasWidth, height: canvasHeight } = canvas.value;
+
+    // If map image is not cached or data changed, regenerate the map image
+    if (!mapImageData) {
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = width;
+      tempCanvas.height = height;
+      const tempCtx = tempCanvas.getContext('2d');
+      if (!tempCtx) return;
+
+      const imgData = tempCtx.createImageData(width, height);
+      const imgArray = imgData.data;
+
+      // Generate image data for the map (this will only be done when map data changes)
+      for (let i = 0; i < data.length; i++) {
+        const val = data[i];
+        const x = i % width;
+        const y = Math.floor(i / width);
+        const flippedY = height - 1 - y; // Flip Y-axis
+        // eslint-disable-next-line prefer-const
+        let color = val === -1 ? 127 : val === 0 ? 240 : val === 100 ? 0 : 255 - val * 2.55;
+
+        const index = (flippedY * width + x) * 4;
+        imgArray[index] = imgArray[index + 1] = imgArray[index + 2] = color;
+        imgArray[index + 3] = 255;
+      }
+
+      tempCtx.putImageData(imgData, 0, 0);
+      mapImageData = tempCanvas;  // Cache the generated image
+    }
+
+    // Clear only the area where the robot will be drawn
+    if (shouldDrawRobot && robotPosition.value) {
+      ctx.clearRect(0, 0, canvasWidth, canvasHeight);  // Clear the whole canvas for a fresh map render
+
+      // Redraw the map image
+      ctx.drawImage(mapImageData, 0, 0, width, height, offsetX.value, offsetY.value, canvasWidth, canvasHeight);
+    } else {
+      // Only redraw the map image if robot position hasn't changed
+      ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      ctx.drawImage(mapImageData, 0, 0, width, height, offsetX.value, offsetY.value, canvasWidth, canvasHeight);
+    }
+
+    // Only draw robot marker if it has moved
+    if (shouldDrawRobot && robotPosition.value) {
+      const { x, y, yaw } = robotPosition.value;
+
+      // Corrected robot positioning to match the map correctly
+      const robotX = ((x - origin_x) / resolution) * (canvasWidth / width) + offsetX.value;
+      const robotY = ((origin_y + height * resolution - y) / resolution) * (canvasHeight / height) + offsetY.value;
+
+      const triangleSize = 10 * zoomLevel.value;
+      const halfSize = triangleSize / 2;
+      const cosA = Math.cos(yaw);
+      const sinA = Math.sin(yaw);
+
+      const points = [
+        { x: 0, y: -triangleSize },
+        { x: -halfSize, y: halfSize },
+        { x: halfSize, y: halfSize }
+      ].map(({ x, y }) => ({
+        x: x * cosA - y * sinA + robotX,
+        y: x * sinA + y * cosA + robotY
+      }));
+
+      ctx.fillStyle = "green";
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      ctx.lineTo(points[1].x, points[1].y);
+      ctx.lineTo(points[2].x, points[2].y);
+      ctx.closePath();
+      ctx.fill();
+
+      const circleRadius = Math.min(triangleSize * 2, Math.min(canvasWidth, canvasHeight) * 0.085);
+      ctx.fillStyle = "rgba(0, 255, 0, 0.3)";
+      ctx.beginPath();
+      ctx.arc(robotX, robotY, circleRadius, 0, 2 * Math.PI);
+      ctx.fill();
+
+      const currentDist = (Math.sqrt((x *x) + (y * y)))
+      const markerDistError = (Math.sqrt((singleGoal.value.x*singleGoal.value.x)+(singleGoal.value.y*singleGoal.value.y)) - currentDist )
+
+      if(Math.abs(markerDistError) >= 0.20) {
+        drawMarker(ctx, singleGoal.value.x, singleGoal.value.y);
+      } 
+
+      console.log("markerError:%f" , markerDistError)
+
+
+    }
+
+    isDrawing = false;
+  });
+};
+
+
+// Optimized resize handling with debounce
+const debouncedAdjustCanvasSize = () => {
+  if (resizeTimeout) {
+    clearTimeout(resizeTimeout);
+  }
+
+  resizeTimeout = setTimeout(() => {
+    adjustCanvasSize();
+    drawMap();
+  }, 200);
+};
+
+
+const updateServerValue = () => {
+  // eslint-disable-next-line prefer-const
+
+
+};
+
+
+onMounted(() => {
+  connectWebSocket();
+  window.addEventListener('resize', debouncedAdjustCanvasSize);
+  // window.addEventListener('websocket_transmission', updateServerValue);
+});
+
+onBeforeUnmount(() => {
+  if (ws) {
+    ws.close();
+  }
+  window.removeEventListener('resize', debouncedAdjustCanvasSize);
+  // window.removeEventListener('websocket_transmission' , updateServerValue);
+});
+</script>
+<style scoped>
+/* Scoped styles for the components, without affecting the body background */
+
+.map-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background-color: #7f7f7f;
+}
+
+.status {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  font-size: 1.2em;
+}
+
+.connected {
+  color: green;
+}
+
+.disconnected {
+  color: red;
+}
+
+.canvas-container {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  touch-action: none;
+  background-color: #7f7f7f;
+}
+
+.zoom-container {
+  position: fixed;
+  bottom: 10px;
+  right: 10px;
+  z-index: 10;
+  border: 2px solid #000;
+  padding: 10px;
+  text-align: center;
+  background-color: rgba(25, 25, 25, 0.6);
+  border-radius: 5px;
+}
+
+.joystick-container {
+  position: fixed;
+  bottom: 10px;
+  /* Distance from the bottom */
+  left: 10px;
+  /* Distance from the left */
+  z-index: 10;
+  /* border: 2px solid #000; */
+  padding: 10px;
+  text-align: center;
+  /* background-color: rgba(25, 25, 25, 0.6); */
+  /* border-radius: 5px; */
+}
+
+.zoom-controls {
+  display: flex;
+  flex-direction: column;
+}
+
+.zoom-controls button {
+  font-size: 24px;
+  padding: 10px;
+  margin: 5px;
+  background-color: rgba(0, 0, 0, 0.6);
+  color: white;
+  border: none;
+  border-radius: 5px;
+}
+
+.zoom-controls button:hover {
+  background-color: rgba(0, 0, 0, 1);
+}
+
+.zoom-size {
+  margin-top: 10px;
+  font-size: 16px;
+  color: #fff;
+}
+
+.zoom-controls button:hover {
+  background-color: rgba(0, 0, 0, 1);
+}
+
+.zoom-size {
+  margin-top: 10px;
+  font-size: 16px;
+  color: #fff;
+}
+</style>

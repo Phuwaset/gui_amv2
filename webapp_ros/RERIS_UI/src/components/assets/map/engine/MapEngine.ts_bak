@@ -1,0 +1,1946 @@
+// src/components/map/engine/MapEngine.ts
+import type { AreaRect, ExportedMap, ExportedMarker, ExportedSection, ExportedSectionPosition, MapState } from '../state/mapState';
+import type { OccupancyGrid } from '../interfaces/map_interface';
+import { SmoothTransform } from './SmoothTransform';
+import { generateMapTexture } from './texture';
+import type { IPosition } from 'src/interfaces/robot_interfaces';
+// import {EventHandlers} from './eventHandlers';
+
+class SpatialHash {
+  private cell: number;
+  private map = new Map<string, IPosition[]>();
+
+
+  constructor(cellSize = 50) { this.cell = cellSize; }
+
+  private key(x: number, y: number) {
+    const cx = Math.floor(x / this.cell), cy = Math.floor(y / this.cell);
+    return `${cx},${cy}`;
+  }
+
+  build(points: IPosition[]) {
+    this.map.clear();
+    for (const p of points) {
+      const k = this.key(p.x, p.y);
+      (this.map.get(k) ?? (this.map.set(k, []), this.map.get(k)!)).push(p);
+    }
+  }
+
+  // fetch all points in cells overlapped by the bbox
+  query(minX: number, minY: number, maxX: number, maxY: number): IPosition[] {
+    const cx0 = Math.floor(minX / this.cell), cy0 = Math.floor(minY / this.cell);
+    const cx1 = Math.floor(maxX / this.cell), cy1 = Math.floor(maxY / this.cell);
+    const out: IPosition[] = [];
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const arr = this.map.get(`${cx},${cy}`);
+        if (arr) out.push(...arr);
+      }
+    }
+    return out;
+  }
+
+}
+
+
+
+
+
+export class MapEngine {
+  private state: MapState;
+  private smoothTransform: SmoothTransform;
+  private renderScheduled = false;
+  private hash = new SpatialHash(64); // tune cell size to your world scale
+
+
+
+  // ====== Map Editor (Brush) Layer ======
+  private editPaintCanvas: HTMLCanvasElement | null = null; // พื้นทับสีดำ = obstacle
+  private editPaintCtx: CanvasRenderingContext2D | null = null;
+
+  private editEraseCanvas: HTMLCanvasElement | null = null; // พื้นลบ = บังคับ free
+  private editEraseCtx: CanvasRenderingContext2D | null = null;
+
+  private brushMode: 'brush' | 'erase' | 'brush_eraser' = 'brush';
+  private brushRadiusPx: number = 6;        // รัศมีพู่กันใน "พิกเซลของแผนที่"
+  private isPainting = false;
+  private lastMapPX: number | null = null;  // พิกัดพิกเซลบนแผนที่ (map-pixel)
+  private lastMapPY: number | null = null;
+
+  // ช่วยแปลง world<->map pixel (ไม่รวม scale/translate ของ canvas)
+  private worldToMapPixelXY(wx: number, wy: number): { mx: number; my: number } {
+    const md = this.state.mapData.value!;
+    const mx = (wx - md.origin_x) / md.resolution;
+    const my = (md.origin_y + md.height * md.resolution - wy) / md.resolution;
+    return { mx, my };
+  }
+  private canvasToMapPixelXY(cx: number, cy: number): { mx: number; my: number } {
+    // const md = this.state.mapData.value!;
+    const scale = this.state.transform.value.scale;
+    const tx = this.state.transform.value.translateX;
+    const ty = this.state.transform.value.translateY;
+    const mapPixelX = (cx - tx) / scale;
+    const mapPixelY = (cy - ty) / scale;
+    return { mx: mapPixelX, my: mapPixelY };
+  }
+
+
+  public setBrushMode(mode: 'brush' | 'erase' | 'brush_eraser') {
+    this.brushMode = mode;
+  }
+  public setBrushSizeMeters(radiusMeters: number) {
+    const md = this.state.mapData.value;
+    if (!md) return;
+    this.brushRadiusPx = Math.max(1, Math.round(radiusMeters / md.resolution));
+    console.log(this.brushRadiusPx)
+  }
+  public setBrushSizePixels(px: number) {
+    this.brushRadiusPx = Math.max(1, Math.round(px));
+  }
+
+  /** เริ่มลากพู่กันจากพิกัด canvas */
+  public beginBrushStrokeAtCanvasXY(cx: number, cy: number) {
+    if (!this.state.mapData.value) return;
+    const { mx, my } = this.canvasToMapPixelXY(cx, cy);
+    this.isPainting = true;
+    this.lastMapPX = mx;
+    this.lastMapPY = my;
+    this.paintDot(mx, my);
+    this.scheduleRender();
+  }
+
+  /** ลากต่อ */
+  public moveBrushStrokeAtCanvasXY(cx: number, cy: number) {
+    if (!this.isPainting || !this.state.mapData.value) return;
+    const { mx, my } = this.canvasToMapPixelXY(cx, cy);
+    // วาดเป็นเส้นต่อเนื่องด้วยการกวาดวงกลมเป็นระยะตามเส้นตรง
+    this.paintLine(this.lastMapPX!, this.lastMapPY!, mx, my);
+    console.log("brush")
+    this.lastMapPX = mx;
+    this.lastMapPY = my;
+    this.scheduleRender();
+  }
+
+  /** ปล่อยพู่กัน */
+  public endBrushStroke() {
+    this.isPainting = false;
+    this.lastMapPX = this.lastMapPY = null;
+  }
+
+  private clearCircle(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+
+  private paintDot(mx: number, my: number) {
+    const r = this.brushRadiusPx;
+
+    if (this.brushMode === 'brush') {
+      if (!this.editPaintCtx) return;
+      this.editPaintCtx.save();
+      this.editPaintCtx.fillStyle = '#000';      // occupied (ดำ)
+      this.editPaintCtx.beginPath();
+      this.editPaintCtx.arc(mx, my, r, 0, Math.PI * 2);
+      this.editPaintCtx.fill();
+      this.editPaintCtx.restore();
+
+      // กันซ้อน: ลบ free ที่บริเวณเดียวกัน
+      if (this.editEraseCtx) this.clearCircle(this.editEraseCtx, mx, my, r + 0.5);
+    }
+
+    else if (this.brushMode === 'brush_eraser') {
+      // วาด free (ขาว) ลงเลเยอร์ erase
+      if (!this.editEraseCtx) return;
+      this.editEraseCtx.save();
+      this.editEraseCtx.fillStyle = '#f0f0f0';      // ไม่ได้ใช้ค่าสีจริง ใช้ alpha เป็น mask
+      this.editEraseCtx.beginPath();
+      this.editEraseCtx.arc(mx, my, r, 0, Math.PI * 2);
+      this.editEraseCtx.fill();
+      this.editEraseCtx.restore();
+
+      // กันซ้อน: ลบดำบริเวณเดียวกัน
+      if (this.editPaintCtx) this.clearCircle(this.editPaintCtx, mx, my, r + 0.5);
+    }
+
+    else if (this.brushMode === 'erase') {
+      // ❗ ลบ “งานวาดเองทั้งหมด” บนทั้งสองเลเยอร์ -> กลับไปใช้ base map
+      if (this.editPaintCtx) this.clearCircle(this.editPaintCtx, mx, my, r);
+      if (this.editEraseCtx) this.clearCircle(this.editEraseCtx, mx, my, r);
+    }
+
+    // ทำ overlay ให้ rebuild ตอนแสดงผล และเรนเดอร์ใหม่
+    this.editorOverlayDirty = true;
+    this.scheduleRender();
+  }
+
+
+  private paintLine(x0: number, y0: number, x1: number, y1: number) {
+    const dx = x1 - x0, dy = y1 - y0;
+    const dist = Math.hypot(dx, dy);
+    const step = Math.max(1, this.brushRadiusPx * 0.6);
+    const n = Math.ceil(dist / step);
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      this.paintDot(x0 + dx * t, y0 + dy * t);
+    }
+  }
+
+  /** วาดเลเยอร์แก้ไขทับลงบนแผนที่ (ใน space แผนที่ 1:1 พิกเซล) */
+  /** วาดเลเยอร์แก้ไขทับลงบนแผนที่ (ใน space แผนที่ 1:1 พิกเซล) */
+  public drawMapEditor(ctx: CanvasRenderingContext2D) {
+    if (!this.editPaintCanvas || !this.editEraseCanvas) return;
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+
+    // 1) ทับดำ (occupied)
+    ctx.globalAlpha = 1.0;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(this.editPaintCanvas, 0, 0);
+
+    // 2) ทับขาว (free) ให้เห็นชัดบนจอ — แค่แสดงผล (export จะ map เป็น 254 อยู่แล้ว)
+    // ctx.globalAlpha = 0.45;                      // ปรับความโปร่งใสได้ตามชอบ
+    ctx.globalCompositeOperation = 'source-over'; // หรือ 'screen' / 'lighter' ก็ได้
+    ctx.drawImage(this.editEraseCanvas, 0, 0);
+
+    ctx.restore();
+  }
+
+  constructor(state: MapState) {
+    this.state = state;
+    this.smoothTransform = new SmoothTransform((transform) => {
+      this.state.transform.value = transform;
+      this.state.zoomLevel.value = transform.scale;
+      this.scheduleRender();
+    });
+  }
+
+
+
+  assignMarkersToRects(
+    markers: IPosition[],
+    rects: AreaRect[]
+  ): AreaRect[] {
+    this.hash.build(markers);
+
+    return rects.map(r => {
+      const minX = Math.min(r.p1.x, r.p2.x);
+      const maxX = Math.max(r.p1.x, r.p2.x);
+      const minY = Math.min(r.p1.y, r.p2.y);
+      const maxY = Math.max(r.p1.y, r.p2.y);
+
+      // get only nearby candidates from the hash, then exact check
+      const candidates = this.hash.query(minX, minY, maxX, maxY);
+      const inside = candidates.filter(m =>
+        m.x >= minX && m.x <= maxX && m.y >= minY && m.y <= maxY
+      );
+
+      return { ...r, dockPosition: inside };
+    });
+  }
+
+  inRect(m: IPosition, minX: number, minY: number, maxX: number, maxY: number) {
+    return m.x >= minX && m.x <= maxX && m.y >= minY && m.y <= maxY;
+  }
+
+  round2(n: number) {
+    return Math.round(n * 100) / 100;
+  }
+
+
+  public export_to_json(
+    multiMarker: IPosition[],
+    multiRect: AreaRect[],
+    mapWidth = 0,
+    mapHeight = 0,
+    opts: { preferDock?: boolean } = { preferDock: true } // prefer dockPosition if present
+  ): ExportedMap {
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+
+    const toKey = (m: Pick<IPosition, "id" | "x" | "y">) =>
+      m?.id ? String(m.id) : `${Math.round(m.x * 1e6)}:${Math.round(m.y * 1e6)}`;
+
+    const byId = new Map<string, IPosition>();
+    const byKey = new Map<string, IPosition>();
+    for (const m of multiMarker) {
+      if (m?.id != null) byId.set(String(m.id), m);
+      byKey.set(toKey(m), m);
+    }
+
+    const inRect = (m: IPosition, minX: number, minY: number, maxX: number, maxY: number) =>
+      m.x >= minX && m.x <= maxX && m.y >= minY && m.y <= maxY;
+
+    const map_section: ExportedSection[] = multiRect.map((rect) => {
+      const minX = Math.min(rect.p1.x, rect.p2.x);
+      const minY = Math.min(rect.p1.y, rect.p2.y);
+      const maxX = Math.max(rect.p1.x, rect.p2.x);
+      const maxY = Math.max(rect.p1.y, rect.p2.y);
+
+      const section_position: ExportedSectionPosition[] = [
+        { x: round2(minX), y: round2(minY), idx: 0 },
+        { x: round2(maxX), y: round2(minY), idx: 1 },
+        { x: round2(maxX), y: round2(maxY), idx: 2 },
+        { x: round2(minX), y: round2(maxY), idx: 3 },
+      ];
+
+      const cx = round2((minX + maxX) / 2);
+      const cy = round2((minY + maxY) / 2);
+
+      // --- build the marker list for this rect ---
+      let rawCandidates: IPosition[] = [];
+
+      if (opts.preferDock && rect.dockPosition?.length) {
+        // Use dock list, but refresh from multiMarker by id/coords for latest label/coords
+        rawCandidates = rect.dockPosition.map((dm) => {
+          if (dm?.id != null && byId.has(String(dm.id))) return byId.get(String(dm.id))!;
+          const key = toKey(dm);
+          return byKey.get(key) ?? dm; // fallback to dm itself
+        });
+      } else {
+        // Compute from multiMarker (ground truth)
+        rawCandidates = multiMarker.filter((m) => inRect(m, minX, minY, maxX, maxY));
+      }
+
+      // Remove duplicates (by id or coord key)
+      const seen = new Set<string>();
+      const markersInRect: IPosition[] = [];
+      for (const m of rawCandidates) {
+        const k = toKey(m);
+        if (!seen.has(k)) {
+          seen.add(k);
+          markersInRect.push(m);
+        }
+      }
+
+      const section_marker: ExportedMarker[] = markersInRect.map((m) => ({
+        marker_name: m.label ?? m.id,
+        marker_type: "point",
+        marker_position: { x: round2(m.x), y: round2(m.y), yaw: round2(m.yaw) },
+      }));
+
+      return {
+        section_lable: rect.label,
+        section_color: rect.color,
+        section_position,
+        section_position_centroid: { x: cx, y: cy },
+        section_marker,
+      };
+    });
+
+    const json_str = {
+      map_section,
+      map_size: { width: mapWidth, height: mapHeight },
+    };
+
+    console.log(json_str)
+    return json_str;
+  }
+
+
+
+  public import_from_json(
+    jsonData: string | ExportedMap,
+    state: MapState
+  ) {
+    try {
+      const parsed: ExportedMap =
+        typeof jsonData === "string" ? JSON.parse(jsonData) : jsonData;
+
+      const mapSections = parsed.map_section ?? [];
+
+      const newRects: AreaRect[] = mapSections.map((section, rectIdx) => {
+        const xs = section.section_position.map((p) => p.x);
+        const ys = section.section_position.map((p) => p.y);
+
+        const minX = Math.min(...xs);
+        const minY = Math.min(...ys);
+        const maxX = Math.max(...xs);
+        const maxY = Math.max(...ys);
+
+        const dockPosition: IPosition[] = (section.section_marker ?? []).map(
+          (m, i) => ({
+            id: `${section.section_lable}_${i}`,
+            label: m.marker_name ?? `marker_${i}`,
+            x: m.marker_position?.x ?? 0,
+            y: m.marker_position?.y ?? 0,
+            yaw: m.marker_position.yaw ?? 0,
+          })
+        );
+
+        return {
+          id: `rect_${rectIdx}`,
+          label: section.section_lable ?? `Area_${rectIdx}`,
+          dockPosition,
+          p1: { x: minX, y: minY },
+          p2: { x: maxX, y: maxY },
+          color: section.section_color,
+        };
+      });
+
+      // flatten all markers into multiGoal
+      const newMarkers: IPosition[] = newRects.flatMap((r) => r.dockPosition);
+
+      // update reactive state
+      state.areaRects.value = newRects;
+      state.multiGoal.value = newMarkers;
+
+      console.log(
+        `✅ Imported ${newRects.length} areaRects, ${newMarkers.length} markers`
+      );
+    } catch (err) {
+      console.error("❌ Failed to import JSON:", err);
+    }
+  }
+
+  /** Helper: random color per rect */
+  randomColor(seed: number) {
+    const palette = [
+      "#22c55e", // green
+      "#3b82f6", // blue
+      "#ef4444", // red
+      "#eab308", // yellow
+      "#8b5cf6", // purple
+      "#f97316", // orange
+    ];
+    return palette[seed % palette.length];
+  }
+
+
+  private drawAreaRects(ctx: CanvasRenderingContext2D) {
+    const rects = this.state.areaRects.value;
+
+    for (const r of rects) {
+      const c1 = this.worldToCanvas(r.p1.x, r.p1.y);
+      const c2 = this.worldToCanvas(r.p2.x, r.p2.y);
+
+      const x = Math.min(c1.x, c2.x);
+      const y = Math.min(c1.y, c2.y);
+      const w = Math.abs(c2.x - c1.x);
+      const h = Math.abs(c2.y - c1.y);
+
+      ctx.save();
+      ctx.globalAlpha = 0.15;
+      ctx.fillStyle = r.color;
+      ctx.fillRect(x, y, w, h);
+
+      ctx.globalAlpha = 1.0;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = r.color;
+      ctx.strokeRect(x, y, w, h);
+
+      // ===== NEW: วาด label ตรงกลางสี่เหลี่ยม =====
+      if (r.label) {
+        ctx.fillStyle = "black"; // สีตัวอักษร
+        ctx.font = "25px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(r.label, x + w / 2, y + h / 2);
+      }
+
+      ctx.restore();
+    }
+
+    // กรอบ preview ตอนลากอยู่
+    if (this.state.isSettingArea.value && this.state.areaStartWorld.value && this.state.areaPreviewWorld.value) {
+      const s = this.worldToCanvas(this.state.areaStartWorld.value.x, this.state.areaStartWorld.value.y);
+      const e = this.worldToCanvas(this.state.areaPreviewWorld.value.x, this.state.areaPreviewWorld.value.y);
+      const x = Math.min(s.x, e.x);
+      const y = Math.min(s.y, e.y);
+      const w = Math.abs(e.x - s.x);
+      const h = Math.abs(e.y - s.y);
+
+      ctx.save();
+      ctx.setLineDash([6, 6]);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = this.state.activeRectColor.value || '#22c55e';
+      ctx.strokeRect(x, y, w, h);
+      ctx.restore();
+    }
+  }
+
+
+  private getCloseIconRectForSelection(): { x: number; y: number; w: number; h: number } | null {
+    const sel = this.state.selectedObject.value;
+    //console.log("selection : ", sel);
+    if (!sel) return null;
+
+    const sz = this.state.closeIconSize.value;
+    const off = this.state.closeIconOffsetPx.value;
+
+    if (sel.type === 'single') {
+      const p = this.worldToCanvas(this.state.singleGoal.value.x, this.state.singleGoal.value.y);
+      return { x: p.x + off, y: p.y - off - sz, w: sz, h: sz };
+    }
+    if (sel.type === 'multi') {
+      const g = this.state.multiGoal.value[sel.index];
+      if (!g) return null;
+      const p = this.worldToCanvas(g.x, g.y);
+      return { x: p.x + off, y: p.y - off - sz, w: sz, h: sz };
+    }
+    if (sel.type === 'rect' || sel.type === 'rect-handle') {
+      const r = this.state.areaRects.value.find(it => it.id === sel.id);
+      if (!r) return null;
+      const c1 = this.worldToCanvas(r.p1.x, r.p1.y);
+      const c2 = this.worldToCanvas(r.p2.x, r.p2.y);
+      const x = Math.min(c1.x, c2.x), y = Math.min(c1.y, c2.y);
+      return { x: x + Math.abs(c2.x - c1.x) - sz - off, y: y + off, w: sz, h: sz };
+    }
+    return null;
+  }
+
+  // Coordinate conversion utilities
+  worldToCanvas(worldX: number, worldY: number): { x: number; y: number } {
+    if (!this.state.mapData.value) return { x: 0, y: 0 };
+
+    const { resolution, origin_x, origin_y, height } = this.state.mapData.value;
+    const mapPixelX = (worldX - origin_x) / resolution;
+    const mapPixelY = (origin_y + height * resolution - worldY) / resolution;
+
+    const canvasX = mapPixelX * this.state.transform.value.scale + this.state.transform.value.translateX;
+    const canvasY = mapPixelY * this.state.transform.value.scale + this.state.transform.value.translateY;
+
+    return { x: canvasX, y: canvasY };
+  }
+
+  canvasToWorld(canvasX: number, canvasY: number): { x: number; y: number } {
+    if (!this.state.mapData.value) return { x: 0, y: 0 };
+
+    const { resolution, origin_x, origin_y, height } = this.state.mapData.value;
+    const mapPixelX = (canvasX - this.state.transform.value.translateX) / this.state.transform.value.scale;
+    const mapPixelY = (canvasY - this.state.transform.value.translateY) / this.state.transform.value.scale;
+
+    const worldX = origin_x + mapPixelX * resolution;
+    const worldY = origin_y + (height - mapPixelY) * resolution;
+
+    return { x: worldX, y: worldY };
+  }
+
+  // Transform management
+  adjustTransformForResize(oldWidth: number, oldHeight: number, newWidth: number, newHeight: number): void {
+    if (!this.state.mapData.value || oldWidth === 0 || oldHeight === 0) return;
+
+    const oldCenterX = oldWidth / 2;
+    const oldCenterY = oldHeight / 2;
+    const worldCenter = this.canvasToWorld(oldCenterX, oldCenterY);
+
+    const newCenterX = newWidth / 2;
+    const newCenterY = newHeight / 2;
+
+    const { resolution, origin_x, origin_y, height } = this.state.mapData.value;
+    const mapPixelX = (worldCenter.x - origin_x) / resolution;
+    const mapPixelY = (origin_y + height * resolution - worldCenter.y) / resolution;
+
+    const newTranslateX = newCenterX - mapPixelX * this.state.transform.value.scale;
+    const newTranslateY = newCenterY - mapPixelY * this.state.transform.value.scale;
+
+    const newTransform = {
+      scale: this.state.transform.value.scale,
+      translateX: newTranslateX,
+      translateY: newTranslateY,
+    };
+
+    this.smoothTransform.setCurrent(newTransform);
+    //console.log('Transform adjusted for resize');
+  }
+
+  // Zoom operations
+  smoothZoom(factor: number, centerX?: number, centerY?: number): void {
+    const currentTransform = this.smoothTransform.getCurrent();
+    const newScale = Math.max(
+      this.state.minZoom,
+      Math.min(this.state.maxZoom, currentTransform.scale * factor)
+    );
+
+    if (Math.abs(newScale - currentTransform.scale) < 0.001) return;
+
+    if (centerX !== undefined && centerY !== undefined) {
+      const scaleRatio = newScale / currentTransform.scale;
+      const newTranslateX = centerX - (centerX - currentTransform.translateX) * scaleRatio;
+      const newTranslateY = centerY - (centerY - currentTransform.translateY) * scaleRatio;
+
+      this.smoothTransform.setTarget({
+        scale: newScale,
+        translateX: newTranslateX,
+        translateY: newTranslateY,
+      });
+    } else {
+      const centerX = this.state.canvasWidth.value / 2;
+      const centerY = this.state.canvasHeight.value / 2;
+      const scaleRatio = newScale / currentTransform.scale;
+
+      const newTranslateX = centerX - (centerX - currentTransform.translateX) * scaleRatio;
+      const newTranslateY = centerY - (centerY - currentTransform.translateY) * scaleRatio;
+
+      this.smoothTransform.setTarget({
+        scale: newScale,
+        translateX: newTranslateX,
+        translateY: newTranslateY,
+      });
+    }
+  }
+
+  zoomIn(): void {
+    this.smoothZoom(1.25);
+  }
+
+  zoomOut(): void {
+    this.smoothZoom(0.8);
+  }
+
+  // Auto-fit map
+  autoFitMap(): void {
+    if (!this.state.mapData.value || !this.state.canvas.value) return;
+
+    const { width: mapWidth, height: mapHeight } = this.state.mapData.value;
+    const canvasAspect = this.state.canvasWidth.value / this.state.canvasHeight.value;
+    const mapAspect = mapWidth / mapHeight;
+
+    let scale: number;
+    const padding = 0.9;
+
+    if (mapAspect > canvasAspect) {
+      scale = (this.state.canvasWidth.value * padding) / mapWidth;
+    } else {
+      scale = (this.state.canvasHeight.value * padding) / mapHeight;
+    }
+
+    const centerX = this.state.canvasWidth.value / 2 - (mapWidth * scale) / 2;
+    const centerY = this.state.canvasHeight.value / 2 - (mapHeight * scale) / 2;
+
+    const initialTransform = {
+      scale: scale,
+      translateX: centerX,
+      translateY: centerY,
+    };
+
+    this.smoothTransform.setCurrent(initialTransform);
+    this.state.previousCanvasSize.value = {
+      width: this.state.canvasWidth.value,
+      height: this.state.canvasHeight.value,
+    };
+
+    //console.log('Auto-fit map:', { scale, transform: initialTransform });
+    this.scheduleRender();
+  }
+
+  // Rendering
+  private scheduleRender(): void {
+    if (this.renderScheduled) return;
+    this.renderScheduled = true;
+    requestAnimationFrame(() => {
+      this.render();
+      this.renderScheduled = false;
+    });
+  }
+
+  render(): void {
+    if (!this.state.canvas.value || !this.state.mapData.value) return;
+
+    const startTime = performance.now();
+    const ctx = this.state.canvas.value.getContext('2d', {
+      alpha: false,
+      desynchronized: true,
+    });
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, this.state.canvasWidth.value, this.state.canvasHeight.value);
+
+    ctx.save();
+    ctx.translate(this.state.transform.value.translateX, this.state.transform.value.translateY);
+    ctx.scale(this.state.transform.value.scale, this.state.transform.value.scale);
+
+    if (this.state.layerVisibility.value.map && this.state.renderState.mapTexture) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(this.state.renderState.mapTexture, 0, 0);
+      this.drawMapEditor(ctx);
+    }
+
+    ctx.restore();
+
+    if (this.state.layerVisibility.value.robot) {
+      this.drawRobot(ctx, 0.25);
+    }
+
+    if (this.state.layerVisibility.value.target) {
+      // if (this.state.activeTool.value === 'mptp') {
+      //   this.drawTarget(ctx);
+      //   this.drawMultiTarget(ctx);
+      // } else {
+
+      this.drawOrigin(ctx);
+      this.drawTarget(ctx);
+      this.drawSingleTarget(ctx);
+      this.drawMultiTarget(ctx);
+      this.drawAreaRects(ctx);
+      this.drawGrid(ctx, this.state.mapData.value.resolution, this.state.transform.value.scale * 0.025);
+      this.renderCloseButton(ctx);
+
+      // }
+
+    }
+
+    const frameTime = performance.now() - startTime;
+    this.updatePerformanceStats(frameTime);
+
+    this.state.renderedFrames.value++;
+    this.state.renderState.needsFullRedraw = false;
+  }
+
+  forceRedraw(): void {
+    this.state.renderState.needsFullRedraw = true;
+    this.scheduleRender();
+  }
+
+
+
+  // Drawing Close 
+  // ===== Render selection delete button (×) =====
+  private renderCloseButton(ctx: CanvasRenderingContext2D) {
+    const sel = this.state.selectedObject.value;
+    //console.log("have selected :", sel);
+    if (!sel) return;
+
+    const r = this.getCloseIconRectForSelection();
+    if (!r) return;
+
+    ctx.save();
+    ctx.fillStyle = "rgba(220, 38, 38, 0.9)";   // bg: แดง
+    ctx.strokeStyle = "white";
+    ctx.lineWidth = 2;
+
+    // วาดกรอบกลม
+    const radius = r.w / 2;
+    ctx.beginPath();
+    ctx.arc(r.x + radius, r.y + radius, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // วาดเครื่องหมาย ×
+    ctx.strokeStyle = "white";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(r.x + r.w * 0.3, r.y + r.h * 0.3);
+    ctx.lineTo(r.x + r.w * 0.7, r.y + r.h * 0.7);
+    ctx.moveTo(r.x + r.w * 0.7, r.y + r.h * 0.3);
+    ctx.lineTo(r.x + r.w * 0.3, r.y + r.h * 0.7);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+
+  // Drawing methods
+  private ADSdrawRobot(ctx: CanvasRenderingContext2D): void {
+    if (!this.state.robotPosition.value || !this.state.mapData.value) return;
+
+    // --- Offset for visualization (0.20 m forward in world coordinates) ---
+    const offsetY = 0.20;
+    const { x, y, yaw } = this.state.robotPosition.value;
+
+    // --- Convert both original and offset positions ---
+    const canvasPos = this.worldToCanvas(x, y + offsetY); // triangle center
+    const realCanvasPos = this.worldToCanvas(x, y);       // actual robot position
+
+    // --- Draw robot shape (offset visualization) ---
+    ctx.save();
+    ctx.translate(canvasPos.x, canvasPos.y);
+    ctx.rotate(yaw);
+
+    const size = Math.max(8, 12 * this.state.transform.value.scale);
+    const halfSize = size / 2;
+
+    // --- Triangle ---
+    ctx.fillStyle = '#00ff00';
+    ctx.beginPath();
+    ctx.moveTo(0, -size);
+    ctx.lineTo(-halfSize, halfSize);
+    ctx.lineTo(halfSize, halfSize);
+    ctx.closePath();
+    ctx.fill();
+
+    // --- Circle around robot (offset position) ---
+    const circleRadius = Math.max(16, 20 * this.state.transform.value.scale);
+    ctx.fillStyle = 'rgba(0, 255, 0, 0.2)';
+    ctx.beginPath();
+    ctx.arc(0, 0, circleRadius, 0, 2 * Math.PI);
+    ctx.fill();
+
+    ctx.restore();
+
+    // --- Draw actual robot position (as small red point) ---
+    ctx.save();
+    ctx.fillStyle = '#ff0000';
+    const pointSize = 3;
+    ctx.beginPath();
+    ctx.arc(realCanvasPos.x, realCanvasPos.y, pointSize, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.restore();
+  }
+
+
+  private drawRobot(ctx: CanvasRenderingContext2D, robotRadiusMeters: number = 1.00): void {
+    if (!this.state.robotPosition.value || !this.state.mapData.value) return;
+
+    const { x, y, yaw } = this.state.robotPosition.value;
+
+    // --- Convert robot position to canvas coordinates ---
+    const realCanvasPos = this.worldToCanvas(x, y);
+
+    // --- Calculate circle radius in canvas pixels ---
+    // Convert two world points: current position and position + radius
+    const radiusWorldPoint = this.worldToCanvas(x + robotRadiusMeters, y);
+    const circleRadiusCanvas = Math.hypot(
+      radiusWorldPoint.x - realCanvasPos.x,
+      radiusWorldPoint.y - realCanvasPos.y
+    );
+
+    // --- Draw robot shape at REAL position ---
+    ctx.save();
+    ctx.translate(realCanvasPos.x, realCanvasPos.y);
+    ctx.rotate(yaw);
+
+    // Calculate triangle size as a fraction of the robot radius
+    const size = circleRadiusCanvas * 0.6;  // Triangle is 60% of circle radius
+    const halfSize = size / 2;
+
+    // --- Draw triangle (robot body) ---
+    ctx.fillStyle = '#00ff00';
+    ctx.beginPath();
+    ctx.moveTo(0, -size);
+    ctx.lineTo(-halfSize, halfSize);
+    ctx.lineTo(halfSize, halfSize);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
+
+    // --- Draw collision/sensor circle (based on real robot radius) ---
+    ctx.save();
+    ctx.translate(realCanvasPos.x, realCanvasPos.y);
+
+    ctx.fillStyle = 'rgba(0, 255, 0, 0.2)';
+    ctx.beginPath();
+    ctx.arc(0, 0, circleRadiusCanvas, 0, 2 * Math.PI);
+    ctx.fill();
+
+    ctx.restore();
+
+    // --- Draw actual robot position (as small red point for reference) ---
+    ctx.save();
+    ctx.fillStyle = '#ff0000';
+    const pointSize = 3;
+    ctx.beginPath();
+    ctx.arc(realCanvasPos.x, realCanvasPos.y, pointSize, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.restore();
+  }
+
+
+
+  private ADSdrawTarget(ctx: CanvasRenderingContext2D): void {
+    if (!this.state.selectGoal.value || !this.state.mapData.value) return;
+    const { x, y } = this.state.selectGoal.value;
+    const canvasPos = this.worldToCanvas(x, y);
+
+    ctx.save();
+    ctx.translate(canvasPos.x, canvasPos.y);
+
+    const markerSize = Math.max(8, 12 * Math.sqrt(this.state.transform.value.scale));
+    const r = markerSize * 3;
+    const cx = 0;
+    const cy = -markerSize;
+
+    const rawYaw = this.state.isSettingYaw.value ? this.state.yawPreview.value : this.state.selectGoal.value.yaw;
+    const yawToDraw = rawYaw;
+
+    const toX = cx + Math.cos(yawToDraw) * r;
+    const toY = -((cy) + Math.sin(-yawToDraw) * r);
+
+    if (!isNaN(yawToDraw)) {
+      if (this.state.isSettingYaw.value) {
+        this.drawYawSelection(ctx, cx, cy, r, markerSize, yawToDraw, toX, toY);
+      }
+    }
+
+    ctx.restore();
+  }
+
+  // Call this from your main render loop (after transforms applied)
+  private drawRoutePath(ctx: CanvasRenderingContext2D, pts: IPosition[]) {
+    if (!pts || pts.length < 2) return;
+
+    // world->screen
+    const toScreen = (p: IPosition) => this.worldToCanvas(p.x, p.y);
+    const sp = pts.map(toScreen);
+
+    // Build path
+    ctx.beginPath();
+    ctx.moveTo(sp[0].x, sp[0].y);
+    for (let i = 1; i < sp.length; i++) ctx.lineTo(sp[i].x, sp[i].y);
+
+    // 1) Outer stroke (halo)
+    ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = Math.max(6, 6 * this.transform.scale); // scale aware
+    ctx.strokeStyle = '#ffffff'; // white halo
+    ctx.stroke();
+    ctx.restore();
+
+    // 2) Inner colored stroke
+    ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(3.5, 3.5 * this.transform.scale);
+    ctx.strokeStyle = '#1a73e8'; // Google blue-ish
+    ctx.stroke();
+    ctx.restore();
+
+    // 3) Optional animated dash to indicate direction
+    ctx.save();
+    ctx.setLineDash([12, 10]);
+    this.dashPhase = (this.dashPhase + 1.5) % 22; // speed
+    ctx.lineDashOffset = -this.dashPhase;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(3.5, 3.5 * this.transform.scale);
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx.stroke();
+    ctx.restore();
+
+    // 4) Destination marker (last point)
+    const end = sp[sp.length - 1];
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(end.x, end.y, Math.max(5, 5 * this.transform.scale), 0, Math.PI * 2);
+    ctx.fillStyle = '#e53935';
+    ctx.fill();
+    ctx.lineWidth = Math.max(2, 2 * this.transform.scale);
+    ctx.strokeStyle = '#ffffff';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  private drawTarget(ctx: CanvasRenderingContext2D): void {
+    if (!this.state.selectGoal.value || !this.state.mapData.value) return;
+
+    const { x, y } = this.state.selectGoal.value;
+    const scale = this.state.transform.value.scale;
+    const p = this.worldToCanvas(x, y);
+
+    ctx.save();
+    ctx.translate(p.x, p.y);
+
+    const markerSize = Math.max(8, 12 * Math.sqrt(scale));
+    const r = markerSize * 3;
+
+    if (this.state.isSettingYaw.value) {
+      const yaw = this.state.yawPreview.value;
+      if (!Number.isNaN(yaw)) {
+        const toX = Math.cos(yaw) * r;
+        const toY = -Math.sin(yaw) * r;
+        this.drawYawSelection(ctx, 0, 0, r, markerSize, yaw, toX, toY);
+      }
+    }
+    // ❌ ไม่มีการวาดเส้น/ลูกศรใดๆ ในโหมดปกติ
+
+    ctx.restore();
+  }
+
+
+
+  private drawYawSelection(
+    ctx: CanvasRenderingContext2D,
+    _cx: number, _cy: number,     // ไม่ใช้งาน
+    r: number,
+    markerSize: number,
+    yawToDraw: number,
+    toX: number,
+    toY: number
+  ): void {
+    // === local origin = (0,0) ===
+
+    // ฐานโดนัท
+    ctx.fillStyle = '#ff0044';
+    ctx.beginPath(); ctx.arc(0, 0, markerSize * 0.8, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath(); ctx.arc(0, 0, markerSize * 0.3, 0, Math.PI * 2); ctx.fill();
+
+    // วงเส้นประ
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // crosshair
+    ctx.beginPath(); ctx.moveTo(-r, 0); ctx.lineTo(r, 0); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, -r); ctx.lineTo(0, r); ctx.stroke();
+
+    // ticks
+    const minorLen = Math.max(4, markerSize * 0.25);
+    const majorLen = Math.max(7, markerSize * 0.4);
+    for (let deg = 0; deg < 360; deg += 15) {
+      const rad = (deg * Math.PI) / 180;
+      const len = (deg % 45 === 0) ? majorLen : minorLen;
+      const sx = Math.cos(rad) * (r - len);
+      const sy = Math.sin(rad) * (r - len);
+      const ex = Math.cos(rad) * r;
+      const ey = Math.sin(rad) * r;
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+    }
+
+    // labels 0/90/180/270
+    const pad = Math.max(10, markerSize * 0.4);
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.font = `${Math.max(11, markerSize * 0.7)}px Arial`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('0°', r + pad, 0);
+    ctx.fillText('90°', 0, -(r + pad));                    // ↑ คือ -y
+    ctx.fillText('180°', -(r + Math.max(14, markerSize * 0.6)), 0);
+    ctx.fillText('270°', 0, r + pad);                      // ↓ คือ +y
+
+    // sweep arc: จาก 0 ถึง yaw (บน canvas y ลง → ใช้มุมลบเพื่อ CCW)
+    let yawDeg = ((yawToDraw * 180) / Math.PI) % 360;
+    if (yawDeg < 0) yawDeg += 360;
+    const yawRadCanvas = -(yawDeg * Math.PI) / 180;
+
+    ctx.strokeStyle = 'rgba(255,0,68,0.35)';
+    ctx.lineWidth = Math.max(2, markerSize * 0.15);
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, yawRadCanvas, yawRadCanvas < 0 ? true : false);
+    ctx.stroke();
+
+    // ลูกศรทิศ
+    ctx.strokeStyle = '#ff0044'; ctx.fillStyle = '#ff0044'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(toX, toY); ctx.stroke();
+
+    const headLength = 5 * this.state.transform.value.scale;
+    const ang = Math.atan2(toY, toX);
+    ctx.beginPath();
+    ctx.moveTo(toX, toY);
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang - Math.PI / 6),
+      toY - headLength * Math.sin(ang - Math.PI / 6)
+    );
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang + Math.PI / 6),
+      toY - headLength * Math.sin(ang + Math.PI / 6)
+    );
+    ctx.closePath(); ctx.fill();
+
+    // ข้อความองศา
+    const yawText = `${yawDeg.toFixed(1)}°`;
+    ctx.fillStyle = '#000000';
+    ctx.font = `${Math.max(12, markerSize * 0.8)}px Arial`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText(yawText, 0, markerSize * 0.5);
+  }
+
+
+  private ADSOLDdrawYawSelection(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number,
+    markerSize: number, yawToDraw: number, toX: number, toY: number): void {
+    // Base marker
+    ctx.fillStyle = '#ff0044';
+    ctx.beginPath();
+    ctx.arc(0, -markerSize, markerSize * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.arc(0, -markerSize, markerSize * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Dashed circle
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Crosshair
+    ctx.beginPath();
+    ctx.moveTo(cx - r, cy);
+    ctx.lineTo(cx + r, cy);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx, cy + r);
+    ctx.stroke();
+
+    // Ticks
+    const minorLen = Math.max(4, markerSize * 0.25);
+    const majorLen = Math.max(7, markerSize * 0.4);
+    for (let deg = 0; deg < 360; deg += 15) {
+      const rad = (deg * Math.PI) / 180;
+      const isMajor = deg % 45 === 0;
+      const len = isMajor ? majorLen : minorLen;
+
+      const sx = cx + Math.cos(rad) * (r - len);
+      const sy = cy + Math.sin(rad) * (r - len);
+      const ex = cx + Math.cos(rad) * r;
+      const ey = cy + Math.sin(rad) * r;
+
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+    }
+
+    // Labels
+    const labelFont = `${Math.max(11, markerSize * 0.7)}px Arial`;
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.font = labelFont;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    ctx.fillText('0°', cx + r + Math.max(10, markerSize * 0.4), cy);
+    ctx.fillText('90°', cx, cy - r - Math.max(10, markerSize * 0.4));
+    ctx.fillText('180°', cx - r - Math.max(14, markerSize * 0.6), cy);
+    ctx.fillText('270°', cx, cy + r + Math.max(10, markerSize * 0.4));
+
+    // Sweep arc
+    let yawDegSweep = (yawToDraw * 180) / Math.PI;
+    if (yawDegSweep < 0) yawDegSweep += 360;
+    const yawRadSweep = (yawDegSweep * Math.PI) / 180;
+
+    ctx.strokeStyle = 'rgba(255,0,68,0.35)';
+    ctx.lineWidth = Math.max(2, markerSize * 0.15);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, -yawRadSweep, false);
+    ctx.stroke();
+
+    // Arrow
+    ctx.strokeStyle = '#ff0044';
+    ctx.fillStyle = '#ff0044';
+    ctx.lineWidth = 2;
+
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(toX, -toY);
+    ctx.stroke();
+
+    const headLength = 5 * this.state.transform.value.scale;
+    const ang = Math.atan2((toY - (-cy)), toX - cx);
+    ctx.beginPath();
+    ctx.moveTo(toX, -toY);
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang - Math.PI / 6),
+      -(toY - headLength * Math.sin(ang - Math.PI / 6))
+    );
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang + Math.PI / 6),
+      -(toY - headLength * Math.sin(ang + Math.PI / 6))
+    );
+    ctx.closePath();
+    ctx.fill();
+
+    let yawDeg = (((yawToDraw * 180) / Math.PI)) % 360;
+    if (yawDeg < 0) yawDeg += 360;
+    const yawText = `${yawDeg.toFixed(1)}°`;
+
+    ctx.fillStyle = '#000000';
+    ctx.font = `${Math.max(12, markerSize * 0.8)}px Arial`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(yawText, 0, markerSize * 0.5);
+  }
+
+  private ADSdrawYawSelection(
+    ctx: CanvasRenderingContext2D,
+    _cx: number, _cy: number,   // ไม่ใช้แล้ว (origin อยู่ที่ 0,0)
+    r: number,
+    markerSize: number,
+    yawToDraw: number,
+    toX: number,
+    toY: number
+  ): void {
+    // === ตั้งต้น: local origin คือ (0,0) ===
+    // อย่า offset ด้วย -markerSize หรือ -toY อีก
+
+    // 1) ฐาน marker (โดนัทกลาง) — อยู่ที่ศูนย์จริง
+    ctx.fillStyle = '#ff0044';
+    ctx.beginPath();
+    ctx.arc(0, 0, markerSize * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.arc(0, 0, markerSize * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 2) วงกลมเส้นประรอบรัศมี r (ศูนย์ที่ 0,0)
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 3) เส้น crosshair
+    ctx.beginPath();
+    ctx.moveTo(-r, 0);
+    ctx.lineTo(r, 0);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, -r);
+    ctx.lineTo(0, r);
+    ctx.stroke();
+
+    // 4) ขีด tick ทุก 15°
+    const minorLen = Math.max(4, markerSize * 0.25);
+    const majorLen = Math.max(7, markerSize * 0.4);
+    for (let deg = 0; deg < 360; deg += 15) {
+      const rad = (deg * Math.PI) / 180;
+      const isMajor = deg % 45 === 0;
+      const len = isMajor ? majorLen : minorLen;
+
+      const sx = Math.cos(rad) * (r - len);
+      const sy = Math.sin(rad) * (r - len);
+      const ex = Math.cos(rad) * r;
+      const ey = Math.sin(rad) * r;
+
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+    }
+
+    // 5) ป้ายองศาหลัก (0/90/180/270)
+    const pad = Math.max(10, markerSize * 0.4);
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.font = `${Math.max(11, markerSize * 0.7)}px Arial`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('0°', r + pad, 0);
+    ctx.fillText('90°', 0, -(r + pad));
+    ctx.fillText('180°', -(r + Math.max(14, markerSize * 0.6)), 0);
+    ctx.fillText('270°', 0, r + pad);
+
+    // 6) โค้งกวาด (sweep arc) จากแกน +X ไปถึง yaw
+    // หมายเหตุ: บน canvas แกน y ลง -> เพื่อให้ CCW ตามคณิต ให้ใช้มุม "ลบ"
+    let yawDeg = ((yawToDraw * 180) / Math.PI) % 360;
+    if (yawDeg < 0) yawDeg += 360;
+    const yawRadCanvas = -(yawDeg * Math.PI) / 180;
+
+    ctx.strokeStyle = 'rgba(255,0,68,0.35)';
+    ctx.lineWidth = Math.max(2, markerSize * 0.15);
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, yawRadCanvas, yawRadCanvas < 0 ? true : false);
+    ctx.stroke();
+
+    // 7) ลูกศรทิศ (ใช้ toX,toY ที่คำนวณจาก origin เดิมแล้ว — ไม่ต้องกลับเครื่องหมายอีก)
+    ctx.strokeStyle = '#ff0044';
+    ctx.fillStyle = '#ff0044';
+    ctx.lineWidth = 2;
+
+    // แกนลูกศร
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(toX, toY);       // << เดิมใช้ (toX, -toY) ทำให้เพี้ยน
+    ctx.stroke();
+
+    // หัวลูกศร
+    const headLength = 5 * this.state.transform.value.scale;
+    const ang = Math.atan2(toY, toX); // << ใช้ toY ตรงๆ (ไม่ต้องอิง cy)
+    ctx.beginPath();
+    ctx.moveTo(toX, toY);
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang - Math.PI / 6),
+      toY - headLength * Math.sin(ang - Math.PI / 6)
+    );
+    ctx.lineTo(
+      toX - headLength * Math.cos(ang + Math.PI / 6),
+      toY - headLength * Math.sin(ang + Math.PI / 6)
+    );
+    ctx.closePath();
+    ctx.fill();
+
+    // 8) ตัวเลของศาใต้ marker
+    const yawText = `${yawDeg.toFixed(1)}°`;
+    ctx.fillStyle = '#000000';
+    ctx.font = `${Math.max(12, markerSize * 0.8)}px Arial`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(yawText, 0, markerSize * 0.5);
+  }
+
+
+  private ADSdrawMultiTarget(ctx: CanvasRenderingContext2D): void {
+    if (!this.state.multiGoal.value || !this.state.mapData.value) return;
+    const goalLength = this.state.multiGoal.value.length;
+
+    for (let i = 0; i < goalLength; i++) {
+      const { x, y, yaw, id, label } = this.state.multiGoal.value[i]; // ต้องมี id ใน object
+      const canvasPos = this.worldToCanvas(x, y);
+
+      ctx.save();
+      ctx.translate(canvasPos.x, canvasPos.y);
+
+      const markerSize = Math.max(8, 12 * Math.sqrt(this.state.transform.value.scale));
+      const r = markerSize * 3;
+      const cx = 0;
+      const cy = -markerSize;
+
+      // วาด marker
+
+      if (this.state.activeTool.value == 'mptp_nav') {
+        ctx.fillStyle = '#178a19';
+      }
+      else {
+        ctx.fillStyle = '#FFA500';
+      }
+
+      ctx.beginPath();
+      ctx.arc(0, -markerSize, markerSize * 0.8, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.arc(0, -markerSize, markerSize * 0.3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // วาด yaw arrow
+      const yawToDraw = yaw;
+      if (this.state.activeTool.value == 'mptp_nav') {
+        ctx.strokeStyle = '#178a19';
+        ctx.fillStyle = '#178a19';
+      }
+      else {
+        ctx.strokeStyle = '#FFA500';
+        ctx.fillStyle = '#FFA500';
+      }
+
+      ctx.lineWidth = 2;
+
+      const toX = cx + Math.cos(yawToDraw) * r;
+      const toY = -((cy) + Math.sin(-yawToDraw) * r);
+
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(toX, -toY);
+      ctx.stroke();
+
+      const headLength = 5 * this.state.transform.value.scale;
+      const ang = Math.atan2((toY - (-cy)), toX - cx);
+      ctx.beginPath();
+      ctx.moveTo(toX, -toY);
+      ctx.lineTo(
+        toX - headLength * Math.cos(ang - Math.PI / 6),
+        -(toY - headLength * Math.sin(ang - Math.PI / 6))
+      );
+      ctx.lineTo(
+        toX - headLength * Math.cos(ang + Math.PI / 6),
+        -(toY - headLength * Math.sin(ang + Math.PI / 6))
+      );
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.restore();
+
+      // ===== NEW: วาดข้อความใต้ marker =====
+      if (id) {
+        ctx.save();
+        ctx.font = `${2.5 * this.state.transform.value.scale}px sans-serif`;
+        ctx.fillStyle = "#000000";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        // ตำแหน่งใต้ marker: canvasPos.y + margin
+        const margin = 1 * this.state.transform.value.scale;
+        const getLabel = label;
+        ctx.fillText(getLabel ? getLabel : id, canvasPos.x, canvasPos.y + margin);
+
+        ctx.restore();
+      }
+    }
+  }
+
+
+  private drawOrigin(ctx: CanvasRenderingContext2D): void {
+    if (!this.state.mapData.value) return;
+
+    // Origin is at (0, 0) in world coordinates
+    const p = this.worldToCanvas(0, 0);
+    const px = Math.round(p.x) + 0.05;
+    const py = Math.round(p.y) + 0.05;
+
+    const scale = (this.state.transform.value.scale) * 0.05;
+    const pinSize = Math.max(12, 16 * Math.sqrt(scale));
+
+    ctx.save();
+
+    // Google Maps style - outer blue circle
+    ctx.fillStyle = 'rgba(59, 130, 246, 0.15)';
+    ctx.beginPath();
+    ctx.arc(px, py, pinSize * 1.8, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Middle circle
+    ctx.fillStyle = 'rgba(59, 130, 246, 0.25)';
+    ctx.beginPath();
+    ctx.arc(px, py, pinSize * 1.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Pin drop shape - outer white circle with blue border
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = Math.max(2, 2.2 * Math.sqrt(scale));
+    ctx.beginPath();
+    ctx.arc(px, py, pinSize * 0.9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Inner blue dot
+    ctx.fillStyle = '#3b82f6';
+    ctx.beginPath();
+    ctx.arc(px, py, pinSize * 0.4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Subtle shadow
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.15)';
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 2;
+
+    // Label pill
+    const fontPx = Math.max(9, 2 * Math.sqrt(scale));
+    ctx.font = `500 ${fontPx}px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = '#1f2937';
+    ctx.fillText('Origin', px, py - pinSize * 1.5);
+
+    ctx.restore();
+  }
+
+
+
+  // Helper function to draw a single target point
+  private drawTargetPoint(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    yaw: number,
+    id: string | undefined,
+    label: string | undefined,
+    action: string | undefined,
+    isNav: boolean
+  ): void {
+    const px = Math.round(x) + 0.5;
+    const py = Math.round(y) + 0.5;
+    const scale = this.state.transform.value.scale;
+
+    // Parse action string: "0.5,1,1000" -> [circleRadius, yawError, delay]
+    let actionCircleRadiusMeters = 0;
+    if (action) {
+      const actionParts = action.split(',').map(v => parseFloat(v.trim()));
+      if (actionParts.length > 0) {
+        actionCircleRadiusMeters = actionParts[0];
+      }
+    }
+
+    // Convert action circle radius from world to canvas using map resolution
+    let actionCircleRadiusCanvas = 0;
+    if (actionCircleRadiusMeters > 0) {
+      const resolution = this.state.mapData.value!.resolution;
+      actionCircleRadiusCanvas = (actionCircleRadiusMeters / resolution) * scale;
+    }
+
+    // palette
+    const accent = isNav ? '#16a34a' : '#ef4444';             // green / red
+    const ringStroke = isNav ? 'rgba(22,163,74,0.45)' : 'rgba(239,68,68,0.45)'; // green / red semi
+    const fillSoft1 = isNav ? 'rgba(22,163,74,0.18)' : 'rgba(239,68,68,0.18)'; // soft inner fill
+    const fillSoft2 = isNav ? 'rgba(22,163,74,0.10)' : 'rgba(239,68,68,0.10)'; // outer gradient
+    const textColor = '#111827';
+
+
+    // sizes
+    const markerSize = Math.max(8, 12 * Math.sqrt(scale));
+    const actualR = Math.max(16, 20 * Math.sqrt(scale));
+    const shaftLen = markerSize * 3;
+    const headLen = 6 * Math.sqrt(scale);
+
+    ctx.save();
+
+    // ---------- actual circle (use action radius if available, otherwise default) ----------
+    const circleRadius = actionCircleRadiusCanvas > 0 ? actionCircleRadiusCanvas : actualR;
+
+    const rg = ctx.createRadialGradient(px, py, circleRadius * 0.2, px, py, circleRadius);
+    rg.addColorStop(0, fillSoft1);
+    rg.addColorStop(1, fillSoft2);
+
+    ctx.fillStyle = rg;
+    ctx.strokeStyle = ringStroke;
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    ctx.arc(px, py, circleRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // center dot
+    ctx.fillStyle = accent;
+    ctx.beginPath();
+    ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    const donutOuter = markerSize * 0.84;
+    const donutInner = markerSize * 0.34;
+    const donutY = py; // at center
+
+    const gd = ctx.createRadialGradient(px, donutY, donutInner * 0.4, px, donutY, donutOuter);
+    gd.addColorStop(0, '#fffefb');
+    gd.addColorStop(0.6, isNav ? 'rgba(182,239,200,0.95)' : 'rgba(255,220,170,0.95)');
+    gd.addColorStop(1, isNav ? 'rgba(158,231,184,0.85)' : 'rgba(255,205,140,0.85)');
+
+    ctx.save();
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = isNav ? 'rgba(22,163,74,0.25)' : 'rgba(255,149,0,0.25)';
+    ctx.fillStyle = gd;
+    ctx.beginPath();
+    ctx.arc(px, donutY, donutOuter, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // inner hole
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(px, donutY, donutInner, 0, Math.PI * 2);
+    ctx.fill();
+
+    // ---------- arrow from donut center with yaw ----------
+    const ax = Math.cos(yaw) * shaftLen;
+    const ay = -Math.sin(yaw) * shaftLen;
+
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = Math.max(1.6, 1.6 * Math.sqrt(scale));
+    ctx.lineCap = 'round';
+
+    ctx.beginPath();
+    ctx.moveTo(px, donutY);
+    ctx.lineTo(px + ax, donutY + ay);
+    ctx.stroke();
+
+    const ang = Math.atan2(ay, ax);
+    ctx.fillStyle = accent;
+    ctx.beginPath();
+    ctx.moveTo(px + ax, donutY + ay);
+    ctx.lineTo(
+      px + ax - headLen * Math.cos(ang - Math.PI / 6),
+      donutY + ay - headLen * Math.sin(ang - Math.PI / 6)
+    );
+    ctx.lineTo(
+      px + ax - headLen * Math.cos(ang + Math.PI / 6),
+      donutY + ay - headLen * Math.sin(ang + Math.PI / 6)
+    );
+    ctx.closePath();
+    ctx.fill();
+
+    // ---------- label pill under the actual circle ----------
+    if (id) {
+      const roundRect = (x: number, y: number, w: number, h: number, r: number) => {
+        const rr = Math.min(r, h / 2, w / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + rr, y);
+        ctx.arcTo(x + w, y, x + w, y + h, rr);
+        ctx.arcTo(x + w, y + h, x, y + h, rr);
+        ctx.arcTo(x, y + h, x, y, rr);
+        ctx.arcTo(x, y, x + w, y, rr);
+        ctx.closePath();
+      };
+
+      const text = label ?? id;
+      const fontPx = Math.max(10, 2.6 * Math.sqrt(scale));
+      const paddingX = 6 * Math.sqrt(scale);
+      const paddingY = 3 * Math.sqrt(scale);
+      const gap = 6 * Math.sqrt(scale);
+
+      ctx.font = `600 ${fontPx}px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'SF Pro Text', sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      const w = ctx.measureText(text).width;
+      const pillW = w + paddingX * 2;
+      const pillH = fontPx + paddingY * 2;
+      const pillX = px - pillW / 2;
+      const pillY = py + circleRadius + gap;
+
+      ctx.save();
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = 'rgba(0,0,0,0.12)';
+      ctx.fillStyle = 'rgba(255,255,255,0.88)';
+      roundRect(pillX, pillY, pillW, pillH, pillH / 2);
+      ctx.fill();
+      ctx.restore();
+
+      ctx.strokeStyle = 'rgba(0,0,0,0.06)';
+      ctx.lineWidth = 1;
+      roundRect(pillX, pillY, pillW, pillH, pillH / 2);
+      ctx.stroke();
+
+      ctx.fillStyle = textColor;
+      ctx.fillText(text, px, pillY + pillH / 2);
+    }
+
+    ctx.restore();
+  }
+
+  private drawMultiTarget(ctx: CanvasRenderingContext2D): void {
+    if (!this.state.multiGoal.value || !this.state.mapData.value) return;
+
+    const goals = this.state.multiGoal.value;
+    const isNav = this.state.activeTool.value === 'mptp_nav';
+
+    for (let i = 0; i < goals.length; i++) {
+      const { x, y, yaw, id, label, action } = goals[i];
+      const p = this.worldToCanvas(x, y);
+      this.drawTargetPoint(ctx, p.x, p.y, yaw, id, label, action, isNav);
+    }
+  }
+
+  private drawSingleTarget(ctx: CanvasRenderingContext2D): void {
+    if (!this.state.singleGoal.value || !this.state.mapData.value) return;
+    const { x, y, yaw, id, label, action } = this.state.singleGoal.value;
+    const p = this.worldToCanvas(x, y);
+    const isNav = false;
+    this.drawTargetPoint(ctx, p.x, p.y, yaw, id, label, action, isNav);
+  }
+
+
+
+
+
+  private drawGrid(
+    ctx: CanvasRenderingContext2D,
+    metersPerWorldUnit = 1.0,
+    gridTransparency = 0.3
+  ) {
+    const { width, height } = ctx.canvas;
+
+    const scale = this.state.transform.value.scale;
+    const offsetX = this.state.transform.value.translateX;
+    const offsetY = this.state.transform.value.translateY;
+
+    const gridStepWorld = (1.0 / metersPerWorldUnit) *1;
+
+    const leftWorld = -offsetX / scale;
+    const topWorld = -offsetY / scale;
+    const rightWorld = leftWorld + width / scale;
+    const bottomWorld = topWorld + height / scale;
+
+    const startX = Math.floor(leftWorld / gridStepWorld) * gridStepWorld;
+    const startY = Math.floor(topWorld / gridStepWorld) * gridStepWorld;
+
+    ctx.save();
+
+    // --- Main grid lines ---
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = `rgba(45, 45, 45, ${gridTransparency})`;
+    ctx.beginPath();
+
+    for (let x = startX; x <= rightWorld + 1e-6; x += gridStepWorld) {
+      const sx = x * scale + offsetX;
+      ctx.moveTo(sx, 0);
+      ctx.lineTo(sx, height);
+    }
+
+    for (let y = startY; y <= bottomWorld + 1e-6; y += gridStepWorld) {
+      const sy = y * scale + offsetY;
+      ctx.moveTo(0, sy);
+      ctx.lineTo(width, sy);
+    }
+    ctx.stroke();
+
+    // --- Axis lines ---
+    ctx.beginPath();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = `rgba(59, 130, 246, ${gridTransparency * 2})`;
+
+    const x0 = 0 * scale + offsetX;
+    const y0 = 0 * scale + offsetY;
+
+    if (x0 >= 0 && x0 <= width) {
+      ctx.moveTo(x0, 0);
+      ctx.lineTo(x0, height);
+    }
+    if (y0 >= 0 && y0 <= height) {
+      ctx.moveTo(0, y0);
+      ctx.lineTo(width, y0);
+    }
+    ctx.stroke();
+
+    // --- Corner accent ---
+    if (x0 >= 0 && x0 <= width && y0 >= 0 && y0 <= height) {
+      ctx.fillStyle = `rgba(59, 130, 246, ${gridTransparency * 0.3})`;
+      ctx.beginPath();
+      ctx.arc(x0, y0, 6 * Math.sqrt(scale), 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  // Performance monitoring
+  private updatePerformanceStats(frameTime: number): void {
+    this.state.performanceState.frameCount++;
+    this.state.performanceState.frameTimes.push(frameTime);
+
+    if (this.state.performanceState.frameTimes.length > 60) {
+      this.state.performanceState.frameTimes.shift();
+    }
+
+    const currentTime = performance.now();
+    if (currentTime - this.state.performanceState.lastFPSTime >= 1000) {
+      this.state.currentFPS.value = Math.round(
+        (this.state.performanceState.frameCount * 1000) /
+        (currentTime - this.state.performanceState.lastFPSTime)
+      );
+      this.state.performanceState.frameCount = 0;
+      this.state.performanceState.lastFPSTime = currentTime;
+
+      const sum = this.state.performanceState.frameTimes.reduce((a, b) => a + b, 0);
+      this.state.averageFrameTime.value = sum / this.state.performanceState.frameTimes.length;
+    }
+  }
+
+  // Map texture generation
+  updateMapTexture(mapData: OccupancyGrid): void {
+    this.state.renderState.mapTexture = generateMapTexture(mapData);
+    const newMapHash = `${mapData.width}-${mapData.height}-${mapData.data.length}`;
+    this.state.renderState.lastMapHash = newMapHash;
+    this.state.mapCenterWorld.value = {
+      x: mapData.origin_x + (mapData.width * mapData.resolution) / 2,
+      y: mapData.origin_y + (mapData.height * mapData.resolution) / 2,
+    };
+
+    // ===== Map Editor layers (ขนาดเท่าตัวแผนที่) =====
+    this.editPaintCanvas = document.createElement('canvas');
+    this.editPaintCanvas.width = mapData.width;
+    this.editPaintCanvas.height = mapData.height;
+    this.editPaintCtx = this.editPaintCanvas.getContext('2d', { willReadFrequently: true });
+
+    this.editEraseCanvas = document.createElement('canvas');
+    this.editEraseCanvas.width = mapData.width;
+    this.editEraseCanvas.height = mapData.height;
+    this.editEraseCtx = this.editEraseCanvas.getContext('2d', { willReadFrequently: true });
+
+    // เคลียร์
+    if (this.editPaintCtx) this.editPaintCtx.clearRect(0, 0, mapData.width, mapData.height);
+    if (this.editEraseCtx) this.editEraseCtx.clearRect(0, 0, mapData.width, mapData.height);
+  }
+
+  // Smooth transform access
+  getSmoothTransform(): SmoothTransform {
+    return this.smoothTransform;
+  }
+
+  /** คืนเมทาดาต้าของแผนที่ (ให้ eventHandlers ใช้ทำ map.yaml) */
+  public getMapMeta() {
+    const md = this.state.mapData.value;
+    if (!md) throw new Error('No map data');
+    return {
+      width: md.width,
+      height: md.height,
+      resolution: md.resolution,
+      origin_x: md.origin_x,
+      origin_y: md.origin_y,
+      // หมายเหตุ: yaw ของ origin ปกติ 0.0 สำหรับ OccupancyGrid
+    };
+  }
+
+  /**
+   * รวมเลเยอร์แก้ไขเข้ากับแผนที่ แล้วสร้าง PGM แบบ Binary (P5)
+   * - scale > 1 จะออกรูป “ความละเอียดสูงกว่าเดิม” (super-sampling แบบ nearest)
+   * - ใช้มาตรฐานสี PGM ของ ROS: 0=occupied(ดำ), 205=unknown, 254=free(ขาว)
+   */
+  public buildEditedPGM(scale = 1): { blob: Blob; width: number; height: number } {
+    const md = this.state.mapData.value;
+    if (!md) throw new Error('No map data');
+
+    // 1) baseGray จาก OccupancyGrid
+    const baseGray = new Uint8Array(md.width * md.height);
+    for (let i = 0; i < md.data.length; i++) {
+      const v = md.data[i];
+      let g = 205; // unknown
+      if (v >= 0 && v <= 100) {
+        g = (v >= 65) ? 0 : 254; // >=65: occupied(ดำ) | อื่นๆ: free
+      }
+      baseGray[i] = g;
+    }
+
+    // 2) overlay paint/erase
+    const paint = this.editPaintCtx?.getImageData(0, 0, md.width, md.height);
+    const erase = this.editEraseCtx?.getImageData(0, 0, md.width, md.height);
+
+    if (paint || erase) {
+      const pData = paint?.data;
+      const eData = erase?.data;
+      for (let i = 0, px = 0; i < baseGray.length; i++, px += 4) {
+        const paintA = pData ? pData[px + 3] : 0;
+        const eraseA = eData ? eData[px + 3] : 0;
+        if (paintA > 0) baseGray[i] = 0;    // ทับดำ = occupied
+        else if (eraseA > 0) baseGray[i] = 254; // ลบ = free
+      }
+    }
+
+    // 3) upscale ถ้าต้องการความละเอียดสูง
+    const outW = Math.max(1, Math.floor(md.width * scale));
+    const outH = Math.max(1, Math.floor(md.height * scale));
+    let outGray = baseGray;
+
+    if (scale !== 1) {
+      outGray = new Uint8Array(outW * outH);
+      for (let y = 0; y < outH; y++) {
+        const sy = Math.floor(y / scale);
+        for (let x = 0; x < outW; x++) {
+          const sx = Math.floor(x / scale);
+          outGray[y * outW + x] = baseGray[sy * md.width + sx];
+        }
+      }
+    }
+
+    // 4) เขียนไฟล์ PGM (P5)
+    const header = `P5\n# Generated by MapEngine.buildEditedPGM\n${outW} ${outH}\n255\n`;
+    const headerBytes = new TextEncoder().encode(header);
+    const blob = new Blob([headerBytes, outGray], { type: 'image/x-portable-graymap' });
+
+    return { blob, width: outW, height: outH };
+  }
+
+
+
+  private applyBrushAtWorld(wx: number, wy: number, brush: { radius_m: number, mode: 'free' | 'occ' | 'unknown' }) {
+    const info = this.state.mapInfo.value;
+    const res = info.resolution;
+    const r_cells = Math.max(1, Math.round(brush.radius_m / res));
+
+    const center = this.worldToMapCell(wx, wy);
+    if (!center) return;
+
+    const { mx, my } = center;
+
+    const targetVal = brush.mode === 'free' ? 0 : (brush.mode === 'occ' ? 100 : -1);
+
+    const w = info.width;
+    const h = info.height;
+    const data = this.state.occGrid.value; // Int8Array หรือ number[] ความยาว w*h
+
+    // วาดวงกลมแบบ raster
+    for (let dy = -r_cells; dy <= r_cells; dy++) {
+      for (let dx = -r_cells; dx <= r_cells; dx++) {
+        if (dx * dx + dy * dy > r_cells * r_cells) continue;
+        const x = mx + dx;
+        const y = my + dy;
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        data[y * w + x] = targetVal;
+      }
+    }
+
+    // เก็บกลับ (ถ้าใช้ reactivity)
+    this.state.occGrid.value = data;
+  }
+
+
+  private occToPGM(v: number): number {
+    if (v < 0) return 205;           // unknown
+    if (v >= 100) return 0;          // occupied
+    // linear map free (0) -> 254, closer to 0 stays bright
+    // บางระบบใช้ threshold ตรงๆ ก็ได้ แต่ค่านี้เป็นที่คุ้นเคย
+    const t = Math.max(0, Math.min(100, v));
+    return Math.round(254 - (t * 254) / 100);
+  }
+
+  exportAsPGM(baseName = 'map') {
+    const md = this.state.mapData.value;
+    if (!md) throw new Error('No map data');
+
+    const w = md.width, h = md.height;
+    const occ = md.data as number[] | Int8Array;
+
+    // 1) Build BODY in "image order" (top-left origin) so it matches your canvases
+    //    Convert from ROS order (bottom-left origin) while copying.
+    const body = new Uint8Array(w * h);
+
+    const mapOccToGray = (v: number): number => {
+      if (v < 0) return 205;      // unknown
+      if (v >= 65) return 0;      // occupied
+      return 254;                 // free
+    };
+
+    // image y: 0..h-1 (top->bottom)
+    for (let y_img = 0; y_img < h; y_img++) {
+      const y_ros = h - 1 - y_img;           // flip while copying
+      const row_ros = y_ros * w;
+      const row_img = y_img * w;
+      for (let x = 0; x < w; x++) {
+        body[row_img + x] = mapOccToGray(occ[row_ros + x]);
+      }
+    }
+
+    // 2) Overlay brush layers (already in image order!)
+    const pImg = this.editPaintCtx?.getImageData(0, 0, w, h);
+    const eImg = this.editEraseCtx?.getImageData(0, 0, w, h);
+    const p = pImg?.data, e = eImg?.data;
+
+    if (p || e) {
+      for (let i = 0, px = 0; i < body.length; i++, px += 4) {
+        const eraseA = e ? e[px + 3] : 0;
+        const paintA = p ? p[px + 3] : 0;
+
+        if (eraseA > 0) {
+          // brush_eraser / erase => FREE (white 254) wins over black
+          body[i] = 254;
+        } else if (paintA > 0) {
+          // brush => OCCUPIED (black 0)
+          body[i] = 0;
+        }
+      }
+    }
+
+    // 3) Write PGM without any further Y flip (already in image order)
+    const header = `P5
+# CREATOR: Reris MapEditor
+${w} ${h}
+255
+`;
+    const headerBytes = new TextEncoder().encode(header);
+    const out = new Uint8Array(headerBytes.length + body.length);
+    out.set(headerBytes, 0);
+    out.set(body, headerBytes.length);
+
+    const blob = new Blob([out], { type: 'image/x-portable-graymap' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.pgm`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    // 4) YAML (origin in world coords; keep negate/thresh standard)
+    const yaml = `image: ${baseName}.pgm
+resolution: ${md.resolution}
+origin: [${md.origin_x}, ${md.origin_y}, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+`;
+    const yblob = new Blob([yaml], { type: 'text/yaml' });
+    const yurl = URL.createObjectURL(yblob);
+    const ya = document.createElement('a');
+    ya.href = yurl;
+    ya.download = `${baseName}.yaml`;
+    ya.click();
+    URL.revokeObjectURL(yurl);
+  }
+
+
+
+}

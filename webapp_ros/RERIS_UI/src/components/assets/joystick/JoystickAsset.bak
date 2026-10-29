@@ -1,0 +1,146 @@
+<template>
+  <div
+    class="joystick-container"
+    @mousedown="startMove"
+    @mousemove="moveJoystick"
+    @mouseup="endMove"
+    @mouseleave="endMove"
+    @touchstart.passive="startMove"
+    @touchmove.prevent="moveJoystick"
+    @touchend="endMove"
+  >
+    <div class="joystick">
+      <div class="rumble" :style="rumblePosition"></div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import './css/JoystickAsset.css'
+import { ref, reactive, defineEmits } from 'vue'
+
+/** ===== Emit ===== */
+const emit = defineEmits<{
+  (e: 'updateVelocity', payload: { Vx: number; Vy: number; heartbeat?: boolean }): void
+}>()
+
+/** ===== Config ===== */
+const joystickSize = 300
+const rumbleSize = 70
+const center = { x: joystickSize / 2, y: joystickSize / 2 }
+const maxDistance = joystickSize / 2 - rumbleSize / 2
+
+// เพดานความเร็ว (หน่วยตามที่ระบบคุณใช้ เช่น m/s) — ปรับตามจริง
+const MAX_VX = 0.80
+const MAX_VY = 0.80
+
+// ทำให้คุมง่ายใกล้ศูนย์
+const DEADZONE = 0.07          // 7% แรกให้เป็นศูนย์
+const RESPONSE_GAMMA = 0.60    // <1 = นุ่มใกล้ศูนย์, >1 = ไวขึ้น
+
+/** ===== State ===== */
+const rumblePosition = reactive({
+  left: '50%',
+  top: '50%',
+  transform: 'translate(-50%, -50%)'
+})
+
+const velocity = reactive({ Vx: 0, Vy: 0 })
+const isMoving = ref(false)
+
+// เผื่อคุณยังมีการส่ง heartbeat อยู่
+const joyFlipBit = ref(false)
+const joyTimerMode = ref(false)
+
+/** ===== Helpers ===== */
+// const isTouchSupported =typeof window !== 'undefined' && 'ontouchstart' in window
+
+function getEventPosition(event: MouseEvent | TouchEvent): { x: number; y: number } {
+  // ใช้ runtime guard ที่ปลอดภัยทุกเบราว์เซอร์
+  if (typeof TouchEvent !== 'undefined' && event instanceof TouchEvent) {
+    const touch = event.touches[0] ?? event.changedTouches[0];
+    return { x: touch?.clientX ?? 0, y: touch?.clientY ?? 0 };
+  }
+
+  // ที่นี่ TS รู้แล้วว่า event เป็น MouseEvent → ไม่ต้อง cast
+  const { clientX, clientY } = event;
+  return { x: clientX, y: clientY };
+}
+
+function shapedGain (r01: number) {
+  if (r01 <= DEADZONE) return 0
+  const t = (r01 - DEADZONE) / (1 - DEADZONE) // map → 0..1
+  const clamped = Math.min(Math.max(t, 0), 1)
+  return Math.pow(clamped, RESPONSE_GAMMA)
+}
+
+/** ===== Handlers ===== */
+function startMove (event: MouseEvent | TouchEvent) {
+  isMoving.value = true
+  updateRumblePosition(event)
+}
+
+function moveJoystick (event: MouseEvent | TouchEvent) {
+  if (!isMoving.value) return
+  // touchmove มี .prevent แล้วใน template
+  updateRumblePosition(event)
+}
+
+function endMove () {
+  isMoving.value = false
+  rumblePosition.left = '50%'
+  rumblePosition.top = '50%'
+
+  velocity.Vx = 0
+  velocity.Vy = 0
+  joyTimerMode.value = false
+
+  emit('updateVelocity', { Vx: 0, Vy: 0 })
+}
+
+function updateRumblePosition (event: MouseEvent | TouchEvent) {
+  const target = event.currentTarget as HTMLElement | null
+  if (!target) return
+
+  const rect = target.getBoundingClientRect()
+  const { x, y } = getEventPosition(event)
+
+  // เวกเตอร์สัมพัทธ์จากจุดศูนย์กลาง (พิกเซล)
+  const relX = x - rect.left - center.x
+  const relY = y - rect.top - center.y
+
+  // คำนวณระยะ & มุม
+  const dist = Math.hypot(relX, relY)
+  const angle = Math.atan2(relY, relX)
+
+  // clamp ระยะให้อยู่ในวงจอย
+  const clampedDist = Math.min(dist, maxDistance)
+
+  // ตำแหน่งปุ่มหลัง clamp (พิกเซล)
+  const knobX = Math.cos(angle) * clampedDist
+  const knobY = Math.sin(angle) * clampedDist
+
+  // วาดปุ่ม
+  rumblePosition.left = `${((knobX + center.x) / joystickSize) * 100}%`
+  rumblePosition.top = `${((knobY + center.y) / joystickSize) * 100}%`
+
+  // ระยะ 0..1 หลัง clamp
+  const r01 = clampedDist / maxDistance
+  const gain = shapedGain(r01)
+
+  // เวกเตอร์หน่วยในสเกล -1..1 หลัง clamp
+  const ux = knobX / maxDistance // แกน X ของจอ
+  const uy = knobY / maxDistance // แกน Y ของจอ
+
+  // Mapping เดิมของคุณ: X จอ → Vy (กลับเครื่องหมาย), Y จอ → Vx (กลับเครื่องหมาย)
+  // แล้ว scale ด้วยเพดาน MAX_VX / MAX_VY และโค้งตอบสนอง gain
+  const Vy_cmd = -ux * MAX_VY * gain
+  const Vx_cmd = -uy * MAX_VX * gain
+
+  // (ถ้าต้องการ smoothing เพิ่มเติม ให้ทำ low-pass ที่นี่)
+  velocity.Vx = Vx_cmd
+  velocity.Vy = Vy_cmd
+
+  emit('updateVelocity', { Vx: velocity.Vx, Vy: velocity.Vy, heartbeat: joyFlipBit.value })
+}
+</script>

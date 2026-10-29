@@ -1,0 +1,107 @@
+/* ===== Photoshop-like Toolbar ===== */
+:root{
+  --tb-size: 36px;         /* button size */
+  --tb-gap: 6px;           /* spacing */
+  --tb-radius: 6px;
+  --tb-bg: #2c2c2c;        /* panel bg */
+  --tb-stroke: #3a3a3a;    /* panel border */
+  --tb-btn: #3a3a3a;       /* btn bg */
+  --tb-btn-hover: #4a4a4a; /* btn hover */
+  --tb-btn-active: #5f9c5f;/* btn active tint */
+  --tb-icon: #eaeaea;      /* icon color */
+  --tb-shadow: 0 1px 0 #000, inset 0 1px 0 rgba(255,255,255,.06);
+}
+
+.status.toolbox{
+  position: absolute; /* or fixed; place wherever you need */
+  left: 12px; top: 12px;
+  z-index: 20;
+  background: var(--tb-bg);
+  border: 1px solid var(--tb-stroke);
+  border-radius: 10px;
+  padding: 8px;
+  box-shadow: var(--tb-shadow);
+  display: inline-flex;
+  flex-direction: column;            /* vertical stack like Photoshop */
+  gap: var(--tb-gap);
+  user-select: none;
+}
+
+/* grid layout (2 columns like PS classic) */
+.status.toolbox .tool-grid{
+  display: grid;
+  grid-template-columns: repeat(2, var(--tb-size));
+  grid-auto-rows: var(--tb-size);
+  gap: var(--tb-gap);
+}
+
+/* button look */
+.tool-btn{
+  width: var(--tb-size);
+  height: var(--tb-size);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: var(--tb-btn);
+  border: 1px solid #2b2b2b;
+  box-shadow: var(--tb-shadow);
+  cursor: pointer;
+  padding: 0;
+  position: relative;
+  transition: background .15s ease, transform .05s ease;
+}
+.tool-btn:hover{ background: var(--tb-btn-hover); }
+.tool-btn:active{ transform: translateY(1px); }
+
+/* active state (radio-like) */
+.tool-btn.is-active{
+  background: linear-gradient(#6fbf6f, #3d7e3d);
+  border-color: #2e5e2e;
+}
+.tool-btn.is-active .icon{ color: #fff; }
+
+/* icons inherit currentColor */
+.icon{
+  color: var(--tb-icon);
+  width: 20px; height: 20px;
+}
+
+/* thin divider like Photoshop */
+.toolbar-sep{
+  height: 1px;
+  background: #1f1f1f;
+  border-top: 1px solid #3b3b3b;
+  margin: 4px 2px;
+  grid-column: 1 / -1; /* span both columns */
+}
+
+/* simple tooltip */
+.tool-btn[data-tip]::after{
+  content: attr(data-tip);
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: #111;
+  color: #ddd;
+  font: 12px/1.2 system-ui, sans-serif;
+  padding: 6px 8px;
+  border: 1px solid #333;
+  border-radius: 6px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.tool-btn:hover::after{ opacity: .95; }
+
+/* optional: tiny corner for “subtools” indicator */
+.tool-btn .corner{
+  position: absolute; right: 2px; bottom: 2px;
+  width: 0; height: 0; border-left: 6px solid transparent;
+  border-top: 6px solid rgba(255,255,255,.5);
+  opacity: .6;
+}
+
+
